@@ -2,6 +2,12 @@ NAME = kfs.iso
 KERNEL = zig-out/bin/kfs.bin
 USERSPACE = zig-out/bin/userspace.bin
 
+NAME_X86_64 = kfs-x86_64.iso
+KERNEL_X86_64 = zig-out/bin/kfs-x86_64.bin
+
+NAME_AARCH64 = kfs-aarch64.bin
+KERNEL_AARCH64 = zig-out/bin/kfs-aarch64.bin
+
 ISO_DIR = iso
 SRC_DIR = src
 USERSPACE_DIR = userspace
@@ -61,7 +67,7 @@ clean:
 	rm -rf $(MOD_TARGET_DIR)/*
 
 fclean: clean
-	rm -rf $(NAME)
+	rm -rf $(NAME) $(NAME_X86_64) $(KERNEL_AARCH64)
 	rm -rf .zig-cache
 
 qemu: $(NAME) $(IMG)
@@ -81,6 +87,32 @@ debug: $(NAME) $(IMG)
 		-ex "layout split src asm" \
 		-ex "b kernel_main" \
 		-ex "c"
+
+$(KERNEL_X86_64):
+	zig build -Darch=x86_64 -freference-trace=20
+	cp $(KERNEL) $(KERNEL_X86_64)
+
+$(NAME_X86_64): $(KERNEL_X86_64)
+	cp $(KERNEL_X86_64) $(ISO_DIR)/boot/kfs.bin
+	$(MKRESCUE) --compress=xz -o $(NAME_X86_64) $(ISO_DIR)
+
+x86_64-qemu: $(NAME_X86_64)
+	qemu-system-x86_64 $(KVM) \
+		-cdrom $(NAME_X86_64) \
+		-serial stdio \
+		-m 4G
+
+$(KERNEL_AARCH64):
+	zig build -Darch=aarch64 -freference-trace=20
+	cp $(KERNEL) $(KERNEL_AARCH64)
+
+aarch64-qemu: $(KERNEL_AARCH64)
+	qemu-system-aarch64 \
+		-machine virt \
+		-cpu cortex-a72 \
+		-m 1G \
+		-nographic \
+		-kernel $(KERNEL_AARCH64)
 
 brew:
 	brew install \
@@ -124,4 +156,4 @@ $(MOD_TARGET_DIR)/%.o: \
 
 $(MOD_TARGET_DIR): $(IMG_DIR)
 
-.PHONY: all clean qemu modules brew
+.PHONY: all clean qemu modules brew x86_64-qemu aarch64-qemu

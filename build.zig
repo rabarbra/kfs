@@ -9,6 +9,7 @@ const userspace_name = "userspace.bin";
 const archs = [_]std.Target.Cpu.Arch{
     std.Target.Cpu.Arch.x86,
     std.Target.Cpu.Arch.x86_64,
+    std.Target.Cpu.Arch.aarch64,
 };
 
 pub fn build(b: *std.Build) !void {
@@ -34,7 +35,8 @@ pub fn build(b: *std.Build) !void {
     const arch_path = switch (arch) {
         std.Target.Cpu.Arch.x86 => "./src/arch/x86/main.zig",
         std.Target.Cpu.Arch.x86_64 => "./src/arch/x86_64/main.zig",
-        else => return
+        std.Target.Cpu.Arch.aarch64 => "./src/arch/aarch64/main.zig",
+        else => return,
     };
 
     const arch_mod = b.addModule("arch", .{
@@ -79,13 +81,25 @@ pub fn build(b: *std.Build) !void {
         .os_tag = .freestanding,
         .abi = .none
     };
-    const Features = std.Target.x86.Feature;
-    target.cpu_features_sub.addFeature(@intFromEnum(Features.mmx));
-    target.cpu_features_sub.addFeature(@intFromEnum(Features.sse));
-    target.cpu_features_sub.addFeature(@intFromEnum(Features.sse2));
-    target.cpu_features_sub.addFeature(@intFromEnum(Features.avx));
-    target.cpu_features_sub.addFeature(@intFromEnum(Features.avx2));
-    target.cpu_features_add.addFeature(@intFromEnum(Features.soft_float));
+
+    if (arch == .x86) {
+        const Features = std.Target.x86.Feature;
+        target.cpu_features_sub.addFeature(@intFromEnum(Features.mmx));
+        target.cpu_features_sub.addFeature(@intFromEnum(Features.sse));
+        target.cpu_features_sub.addFeature(@intFromEnum(Features.sse2));
+        target.cpu_features_sub.addFeature(@intFromEnum(Features.avx));
+        target.cpu_features_sub.addFeature(@intFromEnum(Features.avx2));
+        target.cpu_features_add.addFeature(@intFromEnum(Features.soft_float));
+    } else if (arch == .x86_64) {
+        const Features = std.Target.x86.Feature;
+        target.cpu_features_sub.addFeature(@intFromEnum(Features.avx));
+        target.cpu_features_sub.addFeature(@intFromEnum(Features.avx2));
+    } else if (arch == .aarch64) {
+        const Features = std.Target.aarch64.Feature;
+        target.cpu_features_sub.addFeature(@intFromEnum(Features.neon));
+        target.cpu_features_sub.addFeature(@intFromEnum(Features.fp_armv8));
+    }
+
     const kernel = b.addExecutable(.{
         .name = name,
         .root_module = b.createModule(.{
@@ -94,7 +108,7 @@ pub fn build(b: *std.Build) !void {
                 .preferred_optimize_mode = .ReleaseFast
             }),
             .target = b.resolveTargetQuery(target),
-            .code_model = .kernel,
+            .code_model = if (arch == .x86 or arch == .x86_64) .kernel else .default,
             .strip = false,
             .error_tracing = true,
         }),
@@ -115,56 +129,65 @@ pub fn build(b: *std.Build) !void {
         kernel.setLinkerScript(b.path("./src/arch/x86/linker.ld"));
         kernel.addAssemblyFile(b.path("./src/arch/x86/boot/boot.s"));
     } else if (arch == .x86_64) {
+        kernel.use_llvm = true;
+        kernel.use_lld = true;
         kernel.setLinkerScript(b.path("./src/arch/x86_64/linker.ld"));
         kernel.addAssemblyFile(b.path("./src/arch/x86_64/boot/boot.s"));
+    } else if (arch == .aarch64) {
+        kernel.setLinkerScript(b.path("./src/arch/aarch64/linker.ld"));
+        kernel.addAssemblyFile(b.path("./src/arch/aarch64/boot/boot.s"));
     }
 
     // kernel.setVerboseLink(true);
     b.installArtifact(kernel);
 
-    target.abi = .musl;
-    target.os_tag = .linux;
-    const codegen_step = b.step("gen", "Build module types");
-    const codegen = b.addExecutable(.{
-        .name = "codegen",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/codegen.zig"),
-            .target = b.resolveTargetQuery(target),
-        }),
-    });
-    codegen.root_module.addImport("modules", modules_mod);
-    const run_codegen = b.addRunArtifact(codegen);
-    const output = run_codegen.addOutputFileArg("types.zig");
-    const gen_output_file = b.addInstallFileWithDir(
-        output,
-        .{ .custom = "../types/"},
-        "types.zig"
-    );
-    gen_output_file.step.dependOn(&run_codegen.step);
-    codegen_step.dependOn(&gen_output_file.step);
+    if (arch == .x86) {
+        target.abi = .musl;
+        target.os_tag = .linux;
+        const codegen_step = b.step("gen", "Build module types");
+        const codegen = b.addExecutable(.{
+            .name = "codegen",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/codegen.zig"),
+                .target = b.resolveTargetQuery(target),
+            }),
+        });
+        codegen.root_module.addImport("modules", modules_mod);
+        const run_codegen = b.addRunArtifact(codegen);
+        const output = run_codegen.addOutputFileArg("types.zig");
+        const gen_output_file = b.addInstallFileWithDir(
+            output,
+            .{ .custom = "../types/" },
+            "types.zig"
+        );
+        gen_output_file.step.dependOn(&run_codegen.step);
+        codegen_step.dependOn(&gen_output_file.step);
 
-    const kernel_step = b.step(name, "Build the kernel");
-    kernel.step.dependOn(codegen_step);
-    kernel_step.dependOn(&kernel.step);
+        const kernel_step = b.step(name, "Build the kernel");
+        if (builtin.cpu.arch == .x86 or builtin.cpu.arch == .x86_64) {
+            kernel.step.dependOn(codegen_step);
+        }
+        kernel_step.dependOn(&kernel.step);
 
-    // Add userspace binary
-    const userspace = b.addExecutable(.{
-        .name = userspace_name,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("./userspace/src/main.zig"),
-            .target = b.resolveTargetQuery(target),
-            .optimize = .ReleaseSmall,
-            .code_model = .default,
-            .strip = false,
-            .error_tracing = false,
-            .link_libc = false,
-            .single_threaded = true,
-        }),
-        .linkage = .static,
-    });
-    userspace.setLinkerScript(b.path("./userspace/linker.ld"));
+        // Add userspace binary
+        const userspace = b.addExecutable(.{
+            .name = userspace_name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("./userspace/src/main.zig"),
+                .target = b.resolveTargetQuery(target),
+                .optimize = .ReleaseSmall,
+                .code_model = .default,
+                .strip = false,
+                .error_tracing = false,
+                .link_libc = false,
+                .single_threaded = true,
+            }),
+            .linkage = .static,
+        });
+        userspace.setLinkerScript(b.path("./userspace/linker.ld"));
 
-    const userspace_step = b.step(userspace_name, "Compile userspace init binary");
-    userspace_step.dependOn(&userspace.step);
-    userspace_step.dependOn(&b.addInstallArtifact(userspace, .{}).step);
+        const userspace_step = b.step(userspace_name, "Compile userspace init binary");
+        userspace_step.dependOn(&userspace.step);
+        userspace_step.dependOn(&b.addInstallArtifact(userspace, .{}).step);
+    }
 }

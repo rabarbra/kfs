@@ -71,11 +71,13 @@ stack_top:
 # modules there. This lets the bootloader know it must avoid the addresses.
 .section .bss, "aw", @nobits
 	.align 4096
-boot_page_directory:
-	.skip 4096
-boot_page_table1:
-	.skip 4096
-# Further page tables may be required if the kernel grows beyond 3 MiB.
+.global boot_pml4
+boot_pml4:
+    .skip 4096
+boot_pdpt:
+    .skip 4096
+boot_pd:
+    .skip 4096
 
 # The kernel entry point.
 .section .multiboot.text, "a"
@@ -83,58 +85,118 @@ boot_page_table1:
 .global _start
 .type _start, @function
 _start:
-	# Physical address of boot_page_table1.
-	# TODO: I recall seeing some assembly that used a macro to do the
-	#       conversions to and from physical. Maybe this should be done in this
-	#       code as well?
-	// movl $(initial_page_dir - 0xC0000000), %ecx
-	// movl %ecx, %cr3
+    cli
 
-	mov %cr4, %ecx
-	orl $0x10, %ecx
-	mov %ecx, %cr4
+    # Save multiboot values
+    movl %eax, %esi             # esi = magic
+    movl %ebx, %edi             # edi = multiboot info address
 
-	mov %cr0, %ecx
-	orl $0x80000000, %ecx
-	mov %ecx, %cr0
+    # ------------------------------------------------------------------
+    # Build identity-map page tables (first 1GB)
+    # ------------------------------------------------------------------
 
-	jmp higher_half
+    # Zero all page table pages (3 pages * 4096 bytes)
+    movl $(boot_pml4), %eax
+    movl $(4096 * 3 / 4), %ecx
+    xorl %edx, %edx
+.zero_loop:
+    movl %edx, (%eax)
+    addl $4, %eax
+    decl %ecx
+    jnz .zero_loop
 
+    # PML4[0] -> boot_pdpt (identity map)
+    movl $(boot_pdpt + 0x03), %eax      # Present + Writable
+    movl %eax, (boot_pml4)
+
+    # PDPT[0] -> boot_pd
+    movl $(boot_pd + 0x03), %eax
+    movl %eax, (boot_pdpt)
+
+    # Fill PD with 512 x 2MB huge pages (maps 0..1GB)
+    movl $(boot_pd), %eax
+    movl $0x00000083, %ebx      # Present + Writable + Huge(2MB)
+    movl $512, %ecx
+.fill_pd:
+    movl %ebx, (%eax)
+    movl $0, 4(%eax)
+    addl $0x00200000, %ebx
+    addl $8, %eax
+    decl %ecx
+    jnz .fill_pd
+
+    # ------------------------------------------------------------------
+    # Switch to long mode
+    # ------------------------------------------------------------------
+
+    # Load PML4 into CR3
+    movl $(boot_pml4), %eax
+    movl %eax, %cr3
+
+    # Enable PAE in CR4
+    movl %cr4, %eax
+    orl $(1 << 5), %eax
+    movl %eax, %cr4
+
+    # Enable Long Mode in EFER MSR (0xC0000080)
+    movl $0xC0000080, %ecx
+    rdmsr
+    orl $(1 << 8), %eax         # LME bit
+    wrmsr
+
+    # Enable paging in CR0
+    movl %cr0, %eax
+    orl $(1 << 31), %eax
+    movl %eax, %cr0
+
+    # Load temporary 64-bit GDT and jump to long mode
+    lgdt (boot_gdt64_ptr)
+    ljmp $0x08, $long_mode_start
+
+# ============================================================================
+# Temporary 64-bit GDT
+# ============================================================================
+.align 16
+boot_gdt64:
+    .quad 0x0000000000000000    # Null
+    .quad 0x00AF9A000000FFFF    # Code: 64-bit, DPL0, Execute/Read
+    .quad 0x00AF92000000FFFF    # Data: 64-bit, DPL0, Read/Write
+boot_gdt64_end:
+
+boot_gdt64_ptr:
+    .word boot_gdt64_end - boot_gdt64 - 1
+    .long boot_gdt64
+
+# ============================================================================
+# 64-bit entry
+# ============================================================================
+.code64
 .section .text
-higher_half:
+.global long_mode_start
+long_mode_start:
+    # Reload segment registers with 64-bit data segment
+    movw $0x10, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %fs
+    movw %ax, %gs
+    movw %ax, %ss
 
-	# Set up the stack.
-	mov $stack_top, %esp
-	xor %ebp, %ebp
+    # Set up stack
+    movabsq $stack_top, %rsp
+    xorq %rbp, %rbp
 
-	# call print
-	# Enter the high-level kernel.
-	push %ebx
-	push %eax
-	call kernel_main
+    # Prepare kernel_main arguments (System V AMD64 ABI):
+    #   rdi = first arg  = multiboot2 magic
+    #   rsi = second arg = multiboot2 info physical address
+    # We saved: esi = magic, edi = info_addr at _start
+    movl %esi, %eax             # eax = magic
+    movl %edi, %esi             # rsi = info address (second arg)
+    movl %eax, %edi             # rdi = magic (first arg)
 
-	# Infinite loop if the system has nothing more to do.
-	cli
-1:	hlt
-	jmp 1b
+    call kernel_main
 
-// .section .data
-// .align 4096
-
-// .global initial_page_dir
-// initial_page_dir:
-//     .long 0b10000011           # First entry in the page directory
-//     .long 0b10000011           # First entry in the page directory
-//     .long 0b10000011           # First entry in the page directory
-//     .long 0b10000011           # First entry in the page directory
-//     .rept 768-4
-//     .long 0                    # Fill remaining entries with 0s
-//     .endr
-
-//     .long (0 << 22) | 0b10000011   # Map page 0
-//     .long (1 << 22) | 0b10000011   # Map page 0
-//     .long (2 << 22) | 0b10000011   # Map page 0
-//     .long (3 << 22) | 0b10000011   # Map page 0
-//     .rept 256-4
-//     .long 0                    # Fill remaining entries with 0s
-//     .endr
+    # Halt if kernel returns
+    cli
+1:  hlt
+    jmp 1b

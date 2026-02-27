@@ -2,6 +2,7 @@ const multiboot = @import("arch").multiboot;
 const std = @import("std");
 const arch = @import("arch");
 const krn = @import("../main.zig");
+const builtin = @import("builtin");
 
 const pmm = @import("arch").pmm;
 const vmm = @import("arch").vmm;
@@ -30,7 +31,7 @@ pub const vmalloc = @import("./vmalloc.zig").vmalloc;
 pub const vfree = @import("./vmalloc.zig").vfree;
 pub const vsize = @import("./vmalloc.zig").vsize;
 
-pub const PAGE_OFFSET: usize = 0xC0000000;
+pub const PAGE_OFFSET: usize = if (builtin.cpu.arch == .x86) 0xC0000000 else 0;
 pub const PAGE_SIZE: usize = arch.PAGE_SIZE;
 
 extern const _kernel_end: usize;

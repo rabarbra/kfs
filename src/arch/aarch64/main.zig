@@ -1,75 +1,82 @@
 const std = @import("std");
 const krn = @import("kernel");
 
+const UART_BASE: usize = 0x0900_0000;
+
+// PL011 register offsets
+const UART_DR:      usize = 0x000;  // Data Register
+const UART_FR:      usize = 0x018;  // Flag Register
+const UART_FR_TXFF: u32 = (1 << 5); // Transmit FIFO full
+const UART_FR_RXFE: u32 = (1 << 4); // Receive FIFO empty
+
+fn mmio_write(reg: usize, val: u32) void {
+    const ptr: *volatile u32 = @ptrFromInt(reg);
+    ptr.* = val;
+}
+
+fn mmio_read(reg: usize) u32 {
+    const ptr: *volatile u32 = @ptrFromInt(reg);
+    return ptr.*;
+}
+
+fn uart_putc(c: u8) void {
+    // Wait until transmit FIFO is not full
+    while (mmio_read(UART_BASE + UART_FR) & UART_FR_TXFF != 0) {}
+    mmio_write(UART_BASE + UART_DR, @as(u32, c));
+}
+
+fn uart_getc() ?u8 {
+    if (mmio_read(UART_BASE + UART_FR) & UART_FR_RXFE != 0) {
+        return null;
+    }
+    return @truncate(mmio_read(UART_BASE + UART_DR));
+}
+
+// ============================================================================
+// I/O interface (memory-mapped on aarch64, no port I/O)
+// We map port 0x3F8 (COM1) operations to PL011 UART for serial driver compat
+// ============================================================================
 pub const io = struct {
     pub fn inb(port: u16) u8 {
-        return asm volatile ("inb %[port], %[result]"
-            : [result] "={al}" (-> u8),
-            : [port] "{dx}" (port),
-        );
+        // Map COM1 serial port reads to UART
+        if (port == 0x3F8) {
+            return uart_getc() orelse 0;
+        }
+        if (port == 0x3FD) {
+            // Line Status Register: always report TX empty, ready
+            return 0x60;
+        }
+        return 0;
     }
 
-    pub fn inw(port: u16) u16 {
-        return asm volatile ("inw %[port], %[result]"
-            : [result] "={ax}" (-> u16),
-            : [port] "{dx}" (port),
-        );
+    pub fn inw(_: u16) u16 {
+        return 0;
     }
 
-    pub fn inl(port: u16) u32 {
-        return asm volatile ("inl %[port], %[result]"
-            : [result] "={eax}" (-> u32),
-            : [port] "{dx}" (port),
-        );
+    pub fn inl(_: u16) u32 {
+        return 0;
     }
 
     pub fn outb(port: u16, value: u8) void {
-        asm volatile ("outb %[value], %[port]"
-            :
-            : [value] "{al}" (value),
-              [port] "{dx}" (port),
-        );
-    }
-
-    pub fn outw(port: u16, value: u16) void {
-        asm volatile ("outw %[value], %[port]"
-            :
-            : [value] "{ax}" (value),
-              [port] "{dx}" (port),
-        );
-    }
-
-    pub fn outl(port: u16, value: u32) void {
-        asm volatile ("outl %[value], %[port]"
-            :
-            : [value] "{eax}" (value),
-              [port] "{dx}" (port),
-        );
-    }
-};
-
-// ============================================================================
-// System control
-// ============================================================================
-pub const system = struct {
-    pub fn halt() noreturn {
-        while (true) {
-            asm volatile ("hlt");
+        // Map COM1 serial port writes to UART
+        if (port == 0x3F8) {
+            uart_putc(value);
         }
     }
 
-    pub fn enableWriteProtect() void {
-        // CR0.WP (bit 16)
-        var cr0: u64 = undefined;
-        asm volatile ("mov %%cr0, %[cr0]"
-            : [cr0] "=r" (cr0),
-        );
-        cr0 |= 0x10000;
-        asm volatile ("mov %[cr0], %%cr0"
-            :
-            : [cr0] "r" (cr0),
-        );
+    pub fn outw(_: u16, _: u16) void {}
+
+    pub fn outl(_: u16, _: u32) void {}
+};
+
+pub const system = struct {
+    pub fn halt() noreturn {
+        while (true) {
+            asm volatile ("wfe");
+        }
     }
+
+    pub fn enableWriteProtect() void {}
 };
 
 pub const gdt = struct {
@@ -78,12 +85,12 @@ pub const gdt = struct {
 
 pub const multiboot = struct {
     pub const Header = struct {
-        total_size: u32, 
+        total_size: u32,
         reserved: u32,
     };
 
     pub const Tag = struct {
-        type: u32, 
+        type: u32,
         size: u32,
     };
 
@@ -94,7 +101,7 @@ pub const multiboot = struct {
         reserved: u32,
     };
 
-    pub const TagMemoryMap = struct{
+    pub const TagMemoryMap = struct {
         type: u32 = 6,
         size: u32,
         entry_size: u32,
@@ -105,7 +112,7 @@ pub const multiboot = struct {
         }
     };
 
-    pub const TagFrameBufferInfo = struct{
+    pub const TagFrameBufferInfo = struct {
         type: u32 = 8,
         size: u32,
         addr: u64,
@@ -117,7 +124,7 @@ pub const multiboot = struct {
         reserved: u8,
     };
 
-    pub const TagELFSymbols = struct{
+    pub const TagELFSymbols = struct {
         type: u32 = 9,
         size: u32,
         num: u16,
@@ -135,22 +142,24 @@ pub const multiboot = struct {
         header: *Header,
         curr_tag: ?*Tag = null,
         tag_addresses: [22]u32 = .{0} ** 22,
-        
+
         pub fn init(addr: usize) Multiboot {
             return Multiboot{
                 .addr = addr,
-                .header = @ptrFromInt(addr),
+                .header = @ptrFromInt(if (addr == 0) 0xDEAD_0000 else addr),
             };
         }
 
         pub fn nextTag(self: *Multiboot) ?*Tag {
-            return self.curr_tag;
+            _ = self;
+            return null;
         }
 
         pub fn getTag(_: *Multiboot, comptime T: type) ?*T {
             return null;
         }
-        pub fn relocate(_: *Multiboot, _: usize) usize{
+
+        pub fn relocate(_: *Multiboot, _: usize) usize {
             return 0;
         }
     };
@@ -162,16 +171,16 @@ pub const vmm = struct {
         phys: usize = 0,
     };
     pub const PagingFlags = packed struct {
-        present: bool       = true,
-        writable: bool      = true,
-        user: bool          = false,
+        present: bool = true,
+        writable: bool = true,
+        user: bool = false,
         write_through: bool = false,
         cache_disable: bool = false,
-        accessed: bool      = false,
-        dirty: bool         = false,
-        huge_page: bool     = false,
-        global: bool        = false,
-        available: u3       = 0x000, // available for us to use
+        accessed: bool = false,
+        dirty: bool = false,
+        huge_page: bool = false,
+        global: bool = false,
+        available: u3 = 0x000,
     };
     pub const VMM = struct {
         pmm: *pmm.PMM,
@@ -187,9 +196,9 @@ pub const vmm = struct {
         pub fn mapPage(_: *VMM, _: usize, _: usize, _: PagingFlags) void {}
         pub fn unmapPage(_: *VMM, _: usize, _: bool) void {}
         pub fn releaseArea(_: *VMM, _: usize, _: usize, _: krn.mm.MAP_TYPE) void {}
-        pub fn init(_pmm: *pmm.PMM) VMM{
+        pub fn init(_pmm: *pmm.PMM) VMM {
             return VMM{
-                .pmm = _pmm
+                .pmm = _pmm,
             };
         }
     };
@@ -199,11 +208,11 @@ pub const vmm = struct {
 
 pub const pmm = struct {
     pub const PMM = struct {
-        free_area:  []u32 = &.{},
-        index:      u32 = 0,
-        size:       u64 = 0,
-        begin:      u32 = 0,
-        end:        u32 = 0,
+        free_area: []u32 = &.{},
+        index: u32 = 0,
+        size: u64 = 0,
+        begin: u32 = 0,
+        end: u32 = 0,
 
         pub fn init(_: usize, _: usize) PMM {
             return PMM{};
@@ -220,17 +229,14 @@ pub const pmm = struct {
 
 pub const idt = struct {
     pub fn idtInit() void {}
-    pub const KERNEL_CODE_SEGMENT = 0x08;
-    pub const KERNEL_DATA_SEGMENT = 0x10;
-    pub fn switchTo(_: *krn.task.Task, _: *krn.task.Task, _: *Regs) *Regs{
+    pub const KERNEL_CODE_SEGMENT = 0;
+    pub const KERNEL_DATA_SEGMENT = 0;
+    pub fn switchTo(_: *krn.task.Task, _: *krn.task.Task, _: *Regs) *Regs {
         return &krn.task.initial_task.regs;
     }
     pub fn goUserspace() void {}
 };
 
-// ============================================================================
-// FPU / SSE
-// ============================================================================
 pub const fpu = struct {
     pub const FPUState = extern struct {
         raw: [512 + 15]u8 = .{0} ** (512 + 15),
@@ -247,7 +253,7 @@ pub const fpu = struct {
     };
 
     pub fn initFPU() void {
-        // x86_64 mandates SSE2 support
+        // NEON/VFP is enabled by default configuration on aarch64 QEMU
     }
 
     pub fn saveFPUState(_: *FPUState) void {}
@@ -255,45 +261,39 @@ pub const fpu = struct {
     pub fn setTaskSwitched() void {}
 };
 
-// ============================================================================
-// CPUID
-// ============================================================================
 pub const cpuid = struct {
-    pub fn init() void {}
+    pub fn init() void {
+        // Could read MIDR_EL1, etc. For now, no-op.
+    }
 };
 
-// ============================================================================
-// CPU register context
-// ============================================================================
 pub const Regs = struct {
     pub fn init() Regs {
         return Regs{};
     }
     pub fn setStackPointer(_: *Regs, _: usize) void {}
     pub fn isRing3(_: *Regs) bool {
-        return false;
+        return false; // No ring concept on aarch64; stub always returns kernel mode
     }
 };
 
-// ============================================================================
-// CPU control
-// ============================================================================
 pub const cpu = struct {
     pub fn disableInterrupts() void {
-        asm volatile ("cli");
+        asm volatile ("msr daifset, #0xf");
     }
     pub fn enableInterrupts() void {
-        asm volatile ("sti");
+        asm volatile ("msr daifclr, #0xf");
     }
     pub fn areIntEnabled() bool {
-        var rflags: u64 = undefined;
-        asm volatile ("pushfq; pop %[rflags]"
-            : [rflags] "=r" (rflags),
+        var daif: u64 = undefined;
+        asm volatile ("mrs %[daif], daif"
+            : [daif] "=r" (daif),
         );
-        return (rflags & (1 << 9)) != 0;
+        // DAIF bits: D(9) A(8) I(7) F(6) — if I bit (7) is clear, IRQs are enabled
+        return (daif & (1 << 7)) == 0;
     }
     pub fn getStackFrameAddr() usize {
-        return asm volatile ("mov %%rbp, %[result]"
+        return asm volatile ("mov %[result], x29"
             : [result] "=r" (-> usize),
         );
     }
@@ -303,9 +303,7 @@ pub const syscalls = struct {
     pub fn initSyscalls() void {}
 };
 
-pub fn archReschedule() void {
-
-}
+pub fn archReschedule() void {}
 
 pub fn setupStack(_: usize, _: usize, _: usize, _: usize, _: usize) usize {
     return 0;

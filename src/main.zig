@@ -7,7 +7,7 @@ const multiboot = @import("arch").multiboot;
 const screen = @import("drivers").screen;
 const dbg = @import("debug");
 const drv = @import("drivers");
-const builtin = @import("std").builtin;
+const builtin = @import("builtin");
 const idt = @import("arch").idt;
 const fpu = @import("arch").fpu;
 const cpuid = @import("arch").cpuid;
@@ -25,7 +25,7 @@ const modules = @import("modules");
 
 pub fn panic(
     msg: []const u8,
-    stack: ?*builtin.StackTrace,
+    stack: ?*std.builtin.StackTrace,
     first_trace_addr: ?usize
 ) noreturn {
     krn.logger.ERROR(
@@ -121,6 +121,14 @@ export fn kernel_main(magic: u32, address: u32) noreturn {
     krn.serial = Serial.init(0x3F8);
     krn.serial.setup();
     krn.logger = Logger.init(.DEBUG);
+
+    if (builtin.cpu.arch != .x86) {
+        krn.serial.print("Hello from KFS kernel on ");
+        krn.serial.print(@tagName(builtin.cpu.arch));
+        krn.serial.print("!\r\n");
+        system.halt();
+    }
+
     cpuid.init();
     const boot_info = multiboot.Multiboot.init(address + mm.PAGE_OFFSET);
     krn.boot_info = boot_info;

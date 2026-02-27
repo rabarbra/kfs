@@ -1,46 +1,61 @@
-ENTRY (_start)
+ENTRY(_start)
 
-VMA = 0x10000000;
+PHYS = 0x00100000;
+
+PHDRS
+{
+    bootdata    PT_LOAD FLAGS(0x6); /* RW */
+    boottext    PT_LOAD FLAGS(0x5); /* RX */
+    text        PT_LOAD FLAGS(0x5); /* RX */
+    ro          PT_LOAD FLAGS(0x4); /* R */
+    data        PT_LOAD FLAGS(0x6); /* RW */
+    bss         PT_LOAD FLAGS(0x6); /* RW */
+}
 
 SECTIONS
 {
-    . = 0x00100000;
-	/* The kernel will live at 3GB + 1MB in the virtual address space, */
-	/* which will be mapped to 1MB in the physical address space. */
-	/* Note that we page-align the sections. */
+    . = PHYS;
 
-	.multiboot.data : {
-		KEEP(*(.multiboot.data))
-	}
+    .multiboot.data ALIGN(8) :
+    {
+        KEEP(*(.multiboot.data))
+    }                           :bootdata
 
-	.multiboot.text : {
-		KEEP(*(.multiboot.text))
-	}
+    .multiboot.text ALIGN(4) :
+    {
+        KEEP(*(.multiboot.text))
+    }                           :boottext
 
-	_kernel_start = .;
-	. += VMA;
-	/* Add a symbol that indicates the start address of the kernel. */
-	.text ALIGN (4K) : AT (ADDR (.text) - VMA)
-	{
-		*(.text)
-	}
-	.rodata ALIGN (4K) : AT (ADDR (.rodata) - VMA)
-	{
-		*(.rodata)
-		*(.rodata.*)
-		*(.rodata..*)
-	}
-	.data ALIGN (4K) : AT (ADDR (.data) - VMA)
-	{
-		*(.data)
-		*(.data.*)
-	}
-	.bss ALIGN (4K) : AT (ADDR (.bss) - VMA)
-	{
-		*(COMMON)
-		*(.bss)
-		*(.bootstrap_stack)
-	}
-	/* Add a symbol that indicates the end address of the kernel. */
-	_kernel_end = .;
+    _kernel_start = .;
+
+    .text ALIGN(4K) :
+    {
+        *(.text .text.*)
+    }                           :text
+
+    .rodata ALIGN(4K) :
+    {
+        *(.rodata .rodata.*)
+        *(.eh_frame_hdr)
+        *(.eh_frame)
+    }                           :ro
+
+    .data ALIGN(4K) :
+    {
+        *(.data .data.*)
+    }                           :data
+
+    .bss ALIGN(4K) (NOLOAD) :
+    {
+        *(COMMON)
+        *(.bss .bss.*)
+        *(.bootstrap_stack)
+    }                           :bss
+
+    _kernel_end = .;
+
+    /DISCARD/ : {
+        *(.comment)
+        *(.note*)
+    }
 }
