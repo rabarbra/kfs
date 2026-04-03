@@ -40,7 +40,10 @@ pub const ExampleInode = struct {
             .ino = dir.inode.i_no,
             .name = name,
         };
+        fs.dcache_lock.lock();
+        defer fs.dcache_lock.unlock();
         if (fs.dcache.get(key)) |entry| {
+            entry.ref.ref();
             return entry;
         }
         return kernel.errors.PosixError.ENOENT;
@@ -65,6 +68,7 @@ pub const ExampleInode = struct {
         new_inode.links = 2;
         errdefer kernel.mm.kfree(new_inode);
         var new_dentry = try fs.DEntry.alloc(name, sb, new_inode);
+        new_dentry.ref.ref();
         errdefer kernel.mm.kfree(new_dentry);
         parent.inode.links += 1;
         parent.tree.addChild(&new_dentry.tree);
@@ -83,7 +87,7 @@ pub const ExampleInode = struct {
 
 
         // Lookup if file already exists.
-        _ = base.ops.lookup(parent, name) catch {
+        const dent = base.ops.lookup(parent, name) catch {
             const new_inode = try ExampleInode.new(sb);
             errdefer kernel.mm.kfree(new_inode);
             new_inode.setCreds(
@@ -97,6 +101,7 @@ pub const ExampleInode = struct {
                 base.links += 1;
             return dent;
         };
+        dent.release();
         return kernel.errors.PosixError.EEXIST;
     }
 
@@ -158,7 +163,8 @@ pub const ExampleInode = struct {
             }
         };
         if (new_d) |_d| {
-            if (_d.ref.getValue() > 2)
+            defer _d.release();
+            if (_d.ref.getValue() > 3)
                 return kernel.errors.PosixError.EBUSY;
             if (_d.inode.mode.isDir() and _d.tree.hasChildren())
                 return kernel.errors.PosixError.ENOTEMPTY;

@@ -6,9 +6,14 @@ pub fn getdents(_: u32, _: [*]u8, _: u32) !u32 {
     return errors.EFAULT;
 }
 
-pub fn getdents64(fd: u32, dirents: [*]u8, size: u32) !u32 {
+pub fn getdents64(fd: u32, _dirents: ?[*]u8, size: u32) !u32 {
     krn.logger.INFO("called with {d}\n", .{fd});
+    var dirents = _dirents orelse
+        return errors.EINVAL;
+    @memset(dirents[0..size], 0);
     if (krn.task.current.files.fds.get(fd)) |dir_file| {
+        dir_file.ref.ref();
+        defer dir_file.ref.unref();
         if (dir_file.inode.mode.isDir()) {
             if (dir_file.ops.readdir) |readdir| {
                 if (krn.mm.kmallocSlice(u8, size)) |buf_slice| {

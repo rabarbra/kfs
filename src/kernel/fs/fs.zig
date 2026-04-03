@@ -57,6 +57,9 @@ pub const AT_SYMLINK_FOLLOW	= 0x400;   // Follow symbolic links.
 pub const AT_NO_AUTOMOUNT	= 0x800;   // Suppress terminal automount
 pub const AT_EMPTY_PATH		= 0x1000;  // Allow empty relative
 					   // pathname to operate on dirfd
+pub const SEEK_SET = 0;
+pub const SEEK_CUR = 1;
+pub const SEEK_END = 2;
 
 pub const InoNameContext = struct {
     pub fn hash(self: @This(), val: DentryHash) u64 {
@@ -82,6 +85,8 @@ pub var dcache: std.HashMap(
     InoNameContext,
     99
 ) = undefined;
+
+pub var dcache_lock = kernel.Spinlock.init();
 
 pub var last_ino: u32 = 0;
 var last_ino_lock = kernel.Mutex.init();
@@ -251,7 +256,7 @@ pub const UMode = packed struct {
             }
             return false;
         }
-        if (kernel.task.current.gid == gid) {
+        if (kernel.task.current.inGroup(gid)) {
             if (self.isGReadable()) {
                 return true;
             }
@@ -272,7 +277,7 @@ pub const UMode = packed struct {
             }
             return false;
         }
-        if (kernel.task.current.gid == gid) {
+        if (kernel.task.current.inGroup(gid)) {
             if (self.isGWriteable()) {
                 return true;
             }
@@ -293,7 +298,7 @@ pub const UMode = packed struct {
             }
             return false;
         }
-        if (kernel.task.current.gid == gid) {
+        if (kernel.task.current.inGroup(gid)) {
             if (self.isGExecutable()) {
                 return true;
             }
@@ -315,7 +320,7 @@ pub const UMode = packed struct {
 
     pub fn unSetSUID(self: *UMode) void {
         const mask: u7 = S_ISUID;
-        self.type |= ~mask;
+        self.type &= ~mask;
     }
 
     pub fn setSGID(self: *UMode) void {
@@ -324,7 +329,7 @@ pub const UMode = packed struct {
 
     pub fn unSetSGID(self: *UMode) void {
         const mask: u7 = S_ISGID;
-        self.type |= ~mask;
+        self.type &= ~mask;
     }
 
     pub fn isSUID(self: *const UMode) bool {

@@ -12,7 +12,6 @@ pub fn do_open(
     flags: u32,
     mode: fs.UMode
 ) !u32 {
-    var new: bool = false;
     const fd = tsk.current.files.getNextFD() catch {
         return errors.EMFILE;
     };
@@ -20,6 +19,8 @@ pub fn do_open(
     errdefer _ = tsk.current.files.releaseFD(fd);
     const parent_inode: *fs.Inode = parent_dir.dentry.inode;
     var target_path = parent_dir.clone();
+    var target_path_owned = true;
+    defer if (target_path_owned) target_path.release();
     target_path.stepInto(name, true) catch {
         if (flags & fs.file.O_CREAT != 0) {
             new_mode.type = kernel.fs.S_IFREG;
@@ -48,12 +49,11 @@ pub fn do_open(
                     else => { return errors.ENOENT; },
                 }
             };
-            new = true;
             target_path.release();
-            target_path = .{
-                .dentry = new_dentry,
-                .mnt = parent_dir.mnt,
-            };
+            target_path = fs.path.Path.init(
+                parent_dir.mnt,
+                new_dentry
+            );
         } else {
             return errors.ENOENT;
         }
@@ -62,26 +62,17 @@ pub fn do_open(
         return errors.EACCES;
     }
     const new_file: *fs.File = fs.File.new(target_path) catch {
-        target_path.dentry.tree.del();
-        kernel.mm.kfree(target_path.dentry.inode);
-        kernel.mm.kfree(target_path.dentry);
         return errors.ENOMEM;
     };
+    target_path_owned = false;
     new_file.mode = new_mode;
     new_file.flags = flags;
     new_file.ops.open(new_file, new_file.inode) catch {
-        kernel.mm.kfree(new_file);
-        target_path.dentry.tree.del();
-        kernel.mm.kfree(target_path.dentry.inode);
-        kernel.mm.kfree(target_path.dentry);
+        new_file.ref.unref();
         return errors.ENOENT;
     };
     kernel.task.current.files.fds.put(fd, new_file) catch {
-        // TODO: maybe call close?
-        kernel.mm.kfree(new_file);
-        target_path.dentry.tree.del();
-        kernel.mm.kfree(target_path.dentry.inode);
-        kernel.mm.kfree(target_path.dentry);
+        new_file.ref.unref();
         return errors.ENOENT;
     };
     if (flags & fs.file.O_CLOEXEC != 0)
@@ -117,19 +108,23 @@ pub fn open(
 pub fn openat(
     dirfd: i32,
     path: ?[*:0]const u8,
-    flags: u16,
+    flags: u32,
     mode: fs.UMode,
 ) !u32 {
     if (path == null) {
         return errors.EFAULT;
     }
-    // TODO: Handle absolute paths
     const path_sl: []const u8 = std.mem.span(path.?);
+    if (path_sl.len == 0)
+        return errors.ENOENT;
+    if (dirfd < 0 and dirfd != fs.AT_FDCWD)
+        return errors.EBADF;
+
     kernel.logger.INFO("path {s} fd {d}\n", .{path_sl, dirfd});
     if (!kernel.fs.path.isRelative(path_sl)) {
         return try open(path, flags, mode);
     }
-    if (dirfd == fs.AT_FDCWD and kernel.fs.path.isRelative(path_sl)) {
+    if (dirfd == fs.AT_FDCWD) {
         const cwd = kernel.task.current.fs.pwd.clone();
         defer cwd.release();
         var file_segment: []const u8 = "";
@@ -146,6 +141,10 @@ pub fn openat(
             mode
         );
     } else if (kernel.task.current.files.fds.get(@intCast(dirfd))) |dir| {
+        dir.ref.ref();
+        defer dir.ref.unref();
+        if (!dir.inode.mode.isDir())
+            return errors.ENOTDIR;
         if (dir.path == null)
             return errors.EBADF;
         var file_segment: []const u8 = "";

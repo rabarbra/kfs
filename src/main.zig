@@ -10,6 +10,7 @@ const drv = @import("drivers");
 const builtin = @import("std").builtin;
 const idt = @import("arch").idt;
 const fpu = @import("arch").fpu;
+const cpuid = @import("arch").cpuid;
 const Serial = @import("drivers").Serial;
 const Logger = @import("debug").Logger;
 pub const mm = @import("kernel").mm;
@@ -27,10 +28,22 @@ pub fn panic(
     stack: ?*builtin.StackTrace,
     first_trace_addr: ?usize
 ) noreturn {
+    _ = stack;
+    _ = first_trace_addr;
+    cpu.disableInterrupts();
     krn.logger.ERROR(
-        "\nPANIC: {s}\nfirst_trace_addr {?x}\nstack: {any}\n",
-        .{msg, first_trace_addr, stack}
+        "\nPANIC: [PID {d}]: {s}",
+        .{
+            krn.task.current.pid,
+            msg
+        }
     );
+    if (krn.task.current.regs.esp != 0) {
+        const curr_regs: *cpu.Regs = @ptrFromInt(krn.task.current.regs.esp);
+        curr_regs.dump();
+    } else {
+        cpu.Regs.state().dump();
+    }
     dbg.traceStackTrace(20);
     system.halt();
     while (true) {}
@@ -92,18 +105,37 @@ fn move_root() void {
 }
 
 fn user_thread(_: ?*const anyopaque) i32 {
+    krn.serial.print("[INIT]: user_thread: waiting for kernel ready\n");
     while (kernel_ready == false)
         krn.sched.reschedule();
 
     krn.task.current.mm = krn.task.initial_task.mm;
     krn.task.current.fs = krn.task.initial_task.fs;
     krn.task.current.files = krn.task.initial_task.files;
+    krn.fs.procfs.newProcess(krn.task.current) catch {
+        @panic("Could not create PID 1 procfs entries\n");
+    };
+    krn.serial.print("[INIT]: user_thread: executing /bin/init\n");
+    const path = krn.fs.path.resolve("/bin/init") catch {
+        @panic("execve /bin/init");
+    };
+
+    var file_was_unref: bool = false;
+
+    const file = krn.fs.File.new(path) catch {
+        path.release();
+        @panic("execve /bin/init");
+    };
+
     _ = krn.doExecve(
-        "/bin/init",
+        file,
+        &file_was_unref,
         krn.userspace.argv_init,
         krn.userspace.envp_init,
         false
     ) catch |err| {
+        if (!file_was_unref)
+            file.ref.unref();
         krn.logger.ERROR("Failed execute init: {t}", .{err});
         @panic("execve /bin/init");
     };
@@ -117,47 +149,58 @@ export fn kernel_main(magic: u32, address: u32) noreturn {
         system.halt();
     }
 
-    krn.serial = Serial.init(0x3F8);
-    krn.serial.setup();
-    krn.logger = Logger.init(.WARN);
+    cpuid.init();
+    fpu.initFPU();
+    drv.platform.serial.init_ports();
+    krn.serial.print("[INIT]: Serial done\n");
+    krn.logger = Logger.init(.ERROR);
+    krn.serial.print("[INIT]: Logger done\n");
     const boot_info = multiboot.Multiboot.init(address + mm.PAGE_OFFSET);
     krn.boot_info = boot_info;
-
+    krn.serial.print("[INIT]: Multiboot done\n");
 
     gdt.gdtInit();
-    mm.mmInit(&krn.boot_info);
-    dbg.initSymbolTable(&krn.boot_info);
-    krn.logger.INFO("GDT initialized", .{});
-    krn.logger.INFO("Memory initialized", .{});
-
-    // Initialize FPU early
-    fpu.initFPU();
-
+    krn.serial.print("[INIT]: GDT done\n");
     krn.pit = PIT.init(1000);
-    krn.task.initMultitasking();
-    screen.initScreen(&krn.scr, &krn.boot_info);
+    krn.serial.print("[INIT]: PIT done\n");
     idt.idtInit();
-    krn.logger.INFO("IDT initialized", .{});
-
+    krn.serial.print("[INIT]: IDT done\n");
+    mm.mmInit(&krn.boot_info);
+    krn.serial.print("[INIT]: Memory done\n");
+    krn.task.initMultitasking();
+    krn.serial.print("[INIT]: Multitasking done\n");
+    fpu.setTaskSwitched();
+    cpu.enableInterrupts();
+    krn.serial.print("[INIT]: Interrupts are enabled\n");
+    dbg.initSymbolTable(&krn.boot_info);
+    krn.serial.print("[INIT]: Symbol Table done\n");
+    // Get PID1
+    _ = krn.kthreadCreate(&user_thread, null, "init") catch null;
+    screen.initScreen(&krn.scr, &krn.boot_info);
+    krn.serial.print("[INIT]: Screen done\n");
     keyboard.init();
-
-    krn.logger.INFO("Keyboard handler added", .{});
+    krn.serial.print("[INIT]: Keyboard done\n");
     syscalls.initSyscalls();
+    krn.serial.print("[INIT]: Syscalls done\n");
     drv.cmos.init();
+    krn.serial.print("[INIT]: CMOS done\n");
 
     // FS
     krn.fs.init();
+    krn.serial.print("[INIT]: Filesystems done\n");
 
-    // Get PID1
-    _ = krn.kthreadCreate(&user_thread, null, "init") catch null;
 
     // Devices
     drv.init();
+    krn.serial.print("[INIT]: Drivers and Devices done\n");
     modules.init() catch {
         @panic("Modules file cannot be created\n");
     };
+    krn.serial.print("[INIT]: Modules done\n");
     move_root();
+    krn.serial.print("[INIT]: Moved /\n");
     kernel_ready = true;
+    krn.serial.print("[INIT]: == READY ==\n");
 
     while (true) {
         system.halt();

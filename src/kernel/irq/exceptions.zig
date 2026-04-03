@@ -105,6 +105,16 @@ pub fn hInvalidOpcode(regs: *Regs) *Regs {
 }
 
 pub fn hDeviceNotAvailable(regs: *Regs) *Regs {
+    if (!fpu.supportsTaskState()) {
+        if (regs.isRing3()) {
+            _ = kernel.kill(
+                @intCast(kernel.task.current.pid),
+                @intFromEnum(Signal.SIGILL)
+            ) catch {};
+            return regs;
+        }
+        @panic("DeviceNotAvailable without MMX/SSE support");
+    }
     // Handle FPU context switching
     fpu.handleDeviceNotAvailable();
     return regs;
@@ -178,6 +188,7 @@ pub fn hGeneralProtectionFault(regs: *Regs) *Regs {
 }
 
 pub fn hPageFault(regs: *Regs) *Regs {
+    kernel.serial.print("========PAGE FAULT========\n");
     if (regs.isRing3()) {
         _ = kernel.kill(
             @intCast(kernel.task.current.pid),
@@ -188,8 +199,8 @@ pub fn hPageFault(regs: *Regs) *Regs {
     var addr: u32 = 0;
     addr = arch.vmm.getCR2();
     arch.cpu.disableInterrupts();
-    kernel.logger.DEBUG("PID {d}\n", .{kernel.task.current.pid});
-    kernel.logger.DEBUG(
+    kernel.logger.ERROR("PID {d}\n", .{kernel.task.current.pid});
+    kernel.logger.ERROR(
         \\Page Fault at addr: {x}
         \\EIP: {x}
         \\  present:      {d}
@@ -247,6 +258,13 @@ pub fn hMachineCheck(regs: *Regs) *Regs {
 }
 
 pub fn hSIMDFloatingPointException(regs: *Regs) *Regs {
+    if (regs.isRing3()) {
+        _ = kernel.kill(
+            @intCast(kernel.task.current.pid),
+            @intFromEnum(Signal.SIGFPE)
+        ) catch {};
+        return regs;
+    }
     if (true) @panic("hSIMDFloatingPointException");
     return regs;
 }

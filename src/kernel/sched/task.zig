@@ -9,13 +9,47 @@ const Regs = @import("arch").Regs;
 const currentMs = @import("../time/jiffies.zig").currentMs;
 const reschedule = @import("./scheduler.zig").reschedule;
 const printf = @import("debug").printf;
-const mutex = @import("./mutex.zig").Mutex;
 const signal = @import("./signals.zig");
 const ThreadHandler = @import("./kthread.zig").ThreadHandler;
 const mm = @import("../mm/init.zig");
 const errors = @import("../syscalls/error-codes.zig").PosixError;
 
-var pid: u32 = 0;
+var pid_bitset = std.bit_set.ArrayBitSet(
+    usize,
+    std.math.maxInt(u16) + 1
+).initEmpty();
+var pid_lock = krn.Spinlock.init();
+pub var pid_it: std.bit_set.ArrayBitSet(usize, std.math.maxInt(u16)).Iterator(.{
+    .direction = .forward,
+    .kind = .unset,
+}) = undefined;
+
+pub fn allocPid() !u16 {
+    const lock_state = pid_lock.lock_irq_disable();
+    defer pid_lock.unlock_irq_enable(lock_state);
+
+    if (
+        pid_it.words_remain.len == 0
+        and pid_it.bits_remain == 0
+    ) {
+        pid_it = pid_bitset.iterator(.{
+            .direction = .forward,
+            .kind = .unset,
+        });
+    }
+    if (pid_it.next()) |_pid| {
+        pid_bitset.set(_pid);
+        return @intCast(_pid);
+    }
+    return error.EAGAIN;
+}
+
+pub fn releasePid(_pid: u16) void {
+    const lock_state = pid_lock.lock_irq_disable();
+    defer pid_lock.unlock_irq_enable(lock_state);
+
+    pid_bitset.unset(_pid);
+}
 
 pub const TaskState = enum(u8) {
     RUNNING,
@@ -49,6 +83,8 @@ pub const RefCount = struct {
     pub fn unref(rc: *RefCount) void {
         // release ensures code before unref() happens-before the
         // count is decremented as dropFn could be called by then.
+        if (rc.getValue() == 0)
+            @panic("Underflow\n");
         if (rc.count.fetchSub(1, .release) == 1) {
             // seeing 1 in the counter means that other unref()s have happened,
             // but it doesn't mean that uses before each unref() are visible.
@@ -73,6 +109,8 @@ pub const RefCount = struct {
 };
 
 
+pub const MAX_GROUPS: usize = 32;
+
 // Task is the basic unit of scheduling
 // both threads and processes are tasks
 // and threads share
@@ -82,12 +120,17 @@ pub const RefCount = struct {
 // Anyone using this struct must get refcount
 // and put it when no longer needed.
 pub const Task = struct {
-    pid:            u32,
+
+    pid:            u16,
     tsktype:        TaskType,
     name:           [16] u8,
     uid:            u16,
     gid:            u16,
+    groups:         [MAX_GROUPS]u16 = .{0} ** MAX_GROUPS,
+    groups_count:   u8              = 0,
     pgid:           u16             = 1,
+    sid:            u16             = 1,
+    ctty:           ?*krn.fs.File   = null,
     stack_bottom:   usize,
     state:          TaskState       = TaskState.RUNNING,
     regs:           Regs            = Regs.init(),
@@ -95,7 +138,7 @@ pub const Task = struct {
     limit:          u32             = 0,
 
     // FPU state for context switching
-    fpu_state:      fpu.FPUState    = undefined,
+    fpu_state:      ?*fpu.FPUState  = null,
     fpu_used:       bool            = false,
     save_fpu_state: bool            = false,
 
@@ -104,7 +147,10 @@ pub const Task = struct {
     refcount:       RefCount        = RefCount.init(),
     wakeup_time:    usize           = 0,
 
-    mm:             ?*mm.MM              = null,
+    utime:          u32             = 0,
+    stime:          u32             = 0,
+
+    mm:             ?*mm.MM         = null,
     // Filesystem Info
     fs:             *krn.fs.FSInfo,
     // Open files info
@@ -126,7 +172,11 @@ pub const Task = struct {
             .pid = 0,
             .uid = uid,
             .gid = gid,
+            .groups = .{0} ** MAX_GROUPS,
+            .groups_count = 0,
             .pgid = pgid,
+            .sid = pgid,
+            .ctty = null,
             .stack_bottom = 0,
             .tsktype = tp,
             .fs = undefined,
@@ -135,13 +185,29 @@ pub const Task = struct {
             .limit = 0,
             .name = .{0} ** 16,
             .should_stop = false,
+            .utime = 0,
+            .stime = 0,
         };
     }
 
-    pub fn setup(self: *Task, virt: usize, task_stack_top: usize, task_stack_bottom: usize, name: []const u8) void {
-        self.pid = pid;
+    pub fn inGroup(self: *const Task, group_id: u32) bool {
+        if (group_id > std.math.maxInt(u16))
+            return false;
+        const gid16: u16 = @intCast(group_id);
+        if (self.gid == gid16)
+            return true;
+        const count: usize = self.groups_count;
+        var idx: usize = 0;
+        while (idx < count) : (idx += 1) {
+            if (self.groups[idx] == gid16)
+                return true;
+        }
+        return false;
+    }
+
+    pub fn setup(self: *Task, task_stack_top: usize, task_stack_bottom: usize, name: []const u8) !void {
+        try self.assignPID();
         self.uid = 0;
-        pid += 1;
         self.regs.setStackPointer(task_stack_top);
         self.stack_bottom = task_stack_bottom;
         self.list.setup();
@@ -149,9 +215,11 @@ pub const Task = struct {
         self.refcount = RefCount.init();
         self.fpu_used = false;
         self.save_fpu_state = false;
+        self.fpu_state = null;
         self.mm = &mm.proc_mm.init_mm;
+        self.utime = 0;
+        self.stime = 0;
         self.setName(name);
-        mm.proc_mm.init_mm.vas = virt;
         self.wait_wq.setup();
         self.should_stop = false;
     }
@@ -173,6 +241,7 @@ pub const Task = struct {
     ) anyerror!*Task {
         if (krn.mm.kmalloc(Task)) |task| {
             errdefer krn.mm.kfree(task);
+            try task.assignPID();
             try task.initSelf(task_stack_top, stack_btm, uid, gid, pgid, tp, name);
             return task;
         }
@@ -192,14 +261,28 @@ pub const Task = struct {
         const tmp = Task.init(uid, gid, pgid, tp);
         self.uid = tmp.uid;
         self.gid = tmp.gid;
+        self.groups_count = current.groups_count;
+        @memcpy(
+            self.groups[0..MAX_GROUPS],
+            current.groups[0..MAX_GROUPS]
+        );
         self.pgid = tmp.pgid;
+        self.sid = current.sid;
+        self.ctty = current.ctty;
+        if (self.ctty) |ctty| {
+            ctty.ref.ref();
+        }
         self.state = tmp.state;
         self.refcount = tmp.refcount;
+        self.refcount.ref();
         self.wakeup_time = tmp.wakeup_time;
+        self.utime = tmp.utime;
+        self.stime = tmp.stime;
         self.stack_bottom = tmp.stack_bottom;
         self.tsktype = tmp.tsktype;
         self.save_fpu_state = tmp.save_fpu_state;
         self.fpu_used = tmp.fpu_used;
+        self.fpu_state = tmp.fpu_state;
         self.should_stop = tmp.should_stop;
 
         self.regs = Regs.init();
@@ -207,8 +290,6 @@ pub const Task = struct {
         self.list = lst.ListHead.init();
         self.regs.setStackPointer(task_stack_top);
         self.stack_bottom = stack_btm;
-        self.pid = pid;
-        pid += 1;
         self.list.setup();
         self.tree.setup();
 
@@ -219,6 +300,14 @@ pub const Task = struct {
         self.wait_wq = krn.wq.WaitQueueHead.init();
         self.wait_wq.setup();
 
+        // We should create proc files here because if we do before
+        // we could have the following sequence.
+        // - newProcess creates the files and refs the task
+        // - initSelf runs and sets task.refcount to 1.
+        // - proc destroyInode unrefs the task and we get underflow.
+        if (self.tsktype == .PROCESS) {
+            try krn.fs.procfs.newProcess(self);
+        }
         const lock_state = tasks_lock.lock_irq_disable();
         defer tasks_lock.unlock_irq_enable(lock_state);
 
@@ -240,16 +329,42 @@ pub const Task = struct {
         self.tree.del();
     }
 
-    pub fn findByPid(self: *Task, task_pid: u32) ?*Task {
+    pub fn assignPID(self: *Task) !void {
+        self.pid = try allocPid();
+    }
+
+    fn findByPidRec(self: *Task, task_pid: u16) ?*Task {
         if (self.pid == task_pid) {
             self.refcount.ref();
             return self;
         }
+
         var res: ?*Task = null;
         if (self.tree.hasChildren()) {
             var it = self.tree.child.?.siblingsIterator();
             while (it.next()) |i| {
-                res = i.curr.entry(Task, "tree").*.findByPid(task_pid);
+                res = i.curr.entry(Task, "tree").*.findByPidRec(task_pid);
+                if (res != null)
+                    break ;
+            }
+        }
+        return res;
+    }
+
+    pub fn findByPid(self: *Task, task_pid: u16) ?*Task {
+        if (self.pid == task_pid) {
+            self.refcount.ref();
+            return self;
+        }
+
+        const lock_state = tasks_lock.lock_irq_disable();
+        defer tasks_lock.unlock_irq_enable(lock_state);
+
+        var res: ?*Task = null;
+        if (self.tree.hasChildren()) {
+            var it = self.tree.child.?.siblingsIterator();
+            while (it.next()) |i| {
+                res = i.curr.entry(Task, "tree").*.findByPidRec(task_pid);
                 if (res != null)
                     break ;
             }
@@ -259,6 +374,8 @@ pub const Task = struct {
 
     pub fn refcountChildren(self: *Task, pgid: u32, ref: bool) bool {
         var result: bool = false;
+        const lock_state = tasks_lock.lock_irq_disable();
+        defer tasks_lock.unlock_irq_enable(lock_state);
         if (self.tree.hasChildren()) {
             var it = self.tree.child.?.siblingsIterator();
             while (it.next()) |i| {
@@ -278,7 +395,9 @@ pub const Task = struct {
         return result;
     }
 
-    pub fn findChildByPid(self: *Task, task_pid: u32) ?*Task {
+    pub fn findChildByPid(self: *Task, task_pid: u16) ?*Task {
+        const lock_state = tasks_lock.lock_irq_disable();
+        defer tasks_lock.unlock_irq_enable(lock_state);
         if (self.tree.hasChildren()) {
             var it = self.tree.child.?.siblingsIterator();
             while (it.next()) |i| {
@@ -292,6 +411,39 @@ pub const Task = struct {
         return null;
     }
 
+    pub fn setControllingTTY(self: *Task, file: *krn.fs.File) void {
+        if (self.ctty == file)
+            return;
+        self.clearControllingTTY();
+        file.ref.ref();
+        self.ctty = file;
+    }
+
+    pub fn clearControllingTTY(self: *Task) void {
+        if (self.ctty) |ctty| {
+            ctty.ref.unref();
+            self.ctty = null;
+        }
+    }
+
+    pub fn controllingTTY(self: *Task) ?*krn.fs.File {
+        return self.ctty;
+    }
+
+    pub fn deinitAllocatedData(self: *Task) void {
+        self.clearControllingTTY();
+        self.files.deinit();
+        self.fs.deinit();
+        if (self.mm) |_mm| {
+            _mm.releaseMappings();
+        }
+        if (self.fpu_state) |state| {
+            self.fpu_used = false;
+            krn.mm.kfree(state);
+            self.fpu_state = null;
+        }
+    }
+
     /// tasks_locked defines if tasks_lock is already locked
     pub fn finish(self: *Task, tasks_locked: bool) void {
         if (self.state != .ZOMBIE and self.state != .STOPPED)
@@ -302,6 +454,10 @@ pub const Task = struct {
 
         self.list.del();
         self.refcount.unref();
+        if (self.refcount.getValue() > 0) {
+            krn.logger.ERROR("[PID: {d}] is exiting and is extra referenced", .{self.pid});
+            @panic("exiting task being used");
+        }
         if (stopped_tasks == null) {
             stopped_tasks = &self.list;
             stopped_tasks.?.setup();
@@ -321,6 +477,52 @@ pub const Task = struct {
             parent.refcount.unref();
         }
     }
+
+    pub fn dbgPrint(self: *Task) void {
+        krn.logger.ERROR(
+            \\ Task {d}
+            \\   name: {s}
+            \\   uid: {d}
+            \\   gid: {d}
+            \\   pgid: {d}
+            \\   sid: {d}
+            \\   tsktype: {t}
+            \\   state: {t}
+            \\   fpu_state: 0x{x:0>8}
+            \\   fpu_used: {any}
+            \\   mm: 0x{x:0>8}
+            \\   fs: 0x{x:0>8}
+            \\   files: 0x{x:0>8}
+            \\   stack_bottom: 0x{x:0>8}
+            \\   tls: 0x{x:0>8}
+            \\   limit: {d}
+            \\   list->next: {x}
+            \\   list->prev: {x}
+            \\   tree->parent: {x}
+            \\
+            , .{
+                self.pid,
+                self.name[0..16],
+                self.uid,
+                self.gid,
+                self.pgid,
+                self.sid,
+                self.tsktype,
+                self.state,
+                @intFromPtr(self.fpu_state),
+                self.fpu_used,
+                @intFromPtr(self.mm),
+                @intFromPtr(self.fs),
+                @intFromPtr(self.files),
+                self.stack_bottom,
+                self.tls,
+                self.limit,
+                @intFromPtr(self.list.next),
+                @intFromPtr(self.list.prev),
+                @intFromPtr(self.tree.parent)
+            }
+        );
+    }
 };
 
 pub fn sleep(millis: usize) void {
@@ -339,13 +541,24 @@ pub var stopped_tasks: ?*lst.ListHead = null;
 extern const stack_top: u32;
 extern const stack_bottom: u32;
 
+var inital_fpu_state = arch.fpu.FPUState{};
+
 pub fn initMultitasking() void {
+    pid_it = pid_bitset.iterator(.{
+        .direction = .forward,
+        .kind = .unset,
+    });
     initial_task.setup(
-        @intFromPtr(&vmm.initial_page_dir) - krn.mm.PAGE_OFFSET,
         @intFromPtr(&stack_top),
         @intFromPtr(&stack_bottom),
         "swapper"
-    );
-    krn.irq.registerHandler(0, &krn.timerHandler);
+    ) catch |err| {
+        krn.logger.ERROR("initMultitasking(): {t}", .{err});
+        @panic("Failed to setup initial task!");
+    };
+    initial_task.refcount.ref();
+    initial_task.mm.?.vas = @intFromPtr(&vmm.initial_page_dir) - krn.mm.PAGE_OFFSET;
+    initial_task.fpu_state = &inital_fpu_state;
+    krn.irq.registerHandler(0, &krn.timerHandler, null);
     arch.system.enableWriteProtect();
 }

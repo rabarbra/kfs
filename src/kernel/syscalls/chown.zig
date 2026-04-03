@@ -23,6 +23,8 @@ pub fn do_chown(
     } else {
         from.release();
         if (kernel.task.current.files.fds.get(@intCast(fd))) |file| {
+            file.ref.ref();
+            defer file.ref.unref();
             if (file.path) |_path| {
                 from = _path.clone();
             }
@@ -68,4 +70,21 @@ pub fn fchownat(
         return errors.EINVAL;
     const span = std.mem.span(path);
     return try do_chown(fd, span, uid, gid, flags);
+}
+
+pub fn fchown32(fd: u32, uid: u32, gid: u32) !u32 {
+    if (kernel.task.current.files.fds.get(fd)) |file| {
+        file.ref.ref();
+        defer file.ref.unref();
+        if (file.inode.ops.setattr) |_setattr| {
+            const attr = fs.InodeAttrs{
+                .uid = uid,
+                .gid = gid,
+            };
+            try _setattr(file.inode, &attr);
+            return 0;
+        }
+        return errors.EINVAL;
+    }
+    return errors.EBADF;
 }

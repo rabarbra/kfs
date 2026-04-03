@@ -2,6 +2,7 @@ const arch = @import("arch");
 const krn = @import("../main.zig");
 const kthread = @import("../sched/kthread.zig");
 const errors = @import("error-codes.zig").PosixError;
+const UserDesc = arch.syscalls.thread.UserDesc;
 
 pub const CloneFlags = packed struct(u32) {
     sigmask:         u8 = 0,         // 0x00000000 - 0x000000ff: signal mask to be sent at exit
@@ -40,18 +41,6 @@ pub const CloneFlags = packed struct(u32) {
     pub fn isSupported(self: CloneFlags) bool {
         return @as(u32, @bitCast(self)) & ~@as(u32, @bitCast(supported)) == 0;
     }
-};
-
-const UserDesc = extern struct {
-    entry_number:       i32,
-    base_addr:          u32,
-    limit:              u32,
-    seg_32bit:          u32,
-    contents:           u32,
-    read_exec_only:     u32,
-    limit_in_pages:     u32,
-    seg_not_present:    u32,
-    useable:            u32,
 };
 
 pub fn clone(
@@ -96,6 +85,8 @@ pub fn clone(
         return errors.ENOMEM;
     };
     errdefer krn.mm.kfree(child);
+    child.* = krn.task.Task.init(0, 0, 0, .PROCESS);
+    try child.assignPID();
 
     const stack: u32 = kthread.kthreadStackAlloc(kthread.STACK_PAGES);
     if (stack == 0) {
@@ -115,7 +106,7 @@ pub fn clone(
     // }
     // errdefer if (!flags.VM) {
         errdefer if (child.mm) |mm|
-            krn.mm.kfree(mm);
+            mm.delete();
     // };
 
     if (flags.FS) {
@@ -145,16 +136,23 @@ pub fn clone(
     }
     errdefer if (!flags.FILES) krn.mm.kfree(child.files);
 
-    child.fpu_used = krn.task.current.fpu_used;
-    child.save_fpu_state = false;
-    if (krn.task.current.fpu_used) {
+    var child_fpu_state: ?*arch.fpu.FPUState = null;
+    var child_fpu_used = krn.task.current.fpu_used;
+    if (krn.task.current.fpu_used and krn.task.current.fpu_state != null) {
         if (krn.task.current.save_fpu_state) {
-            arch.fpu.saveFPUState(&krn.task.current.fpu_state);
+            arch.fpu.saveFPUState(krn.task.current.fpu_state.?);
             krn.task.current.save_fpu_state = false;
             arch.fpu.setTaskSwitched();
         }
-        child.fpu_state = krn.task.current.fpu_state;
+        child_fpu_state = krn.mm.kmalloc(arch.fpu.FPUState) orelse {
+            krn.logger.ERROR("clone: failed to alloc child fpu state", .{});
+            return errors.ENOMEM;
+        };
+        child_fpu_state.?.* = krn.task.current.fpu_state.?.*;
+    } else {
+        child_fpu_used = false;
     }
+    errdefer if (child_fpu_state) |state| krn.mm.kfree(state);
 
     const stack_top = stack + kthread.STACK_SIZE - @sizeOf(arch.Regs);
     const parent_regs: *arch.Regs = @ptrFromInt(arch.gdt.tss.esp0 - @sizeOf(arch.Regs));
@@ -169,7 +167,7 @@ pub fn clone(
     if (flags.SETTLS) {
         const user_desc: *const UserDesc = @ptrFromInt(tls);
         child.tls = user_desc.base_addr;
-        child.limit = if (user_desc.limit_in_pages != 0) user_desc.limit
+        child.limit = if (user_desc.bits.limit_in_pages != 0) user_desc.limit
             else 0xFFFFFFFF;
     } else {
         child.tls = krn.task.current.tls;
@@ -188,6 +186,10 @@ pub fn clone(
         krn.logger.ERROR("clone: failed to init child task: {t}", .{err});
         return errors.ENOMEM;
     };
+    errdefer krn.fs.procfs.deleteProcess(child);
+    child.fpu_state = child_fpu_state;
+    child.fpu_used = child_fpu_used;
+    child.save_fpu_state = false;
 
     if (flags.PARENT_SETTID) {
         if (parent_tid) |ptid| {
@@ -200,8 +202,6 @@ pub fn clone(
             ctid.* = child.pid;
         }
     }
-
-    try krn.fs.procfs.newProcess(child);
     return @intCast(child.pid);
 }
 

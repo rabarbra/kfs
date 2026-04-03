@@ -47,7 +47,7 @@ const Ext2SuperData = extern struct {
 	s_checkinterval	                :u32,	// max. time between checks
 	s_creator_os			:u32,	// OS
 	s_rev_level			:u32,	// Revision level
-	s_def_resuid			:u16,	// Default uid for reserved blocks 
+	s_def_resuid			:u16,	// Default uid for reserved blocks
 	s_def_resgid			:u16,	// Default gid for reserved blocks
 
 	//
@@ -57,7 +57,7 @@ const Ext2SuperData = extern struct {
 	// the incompatible feature set is that if there is a bit set
 	// in the incompatible feature set that the kernel doesn't
 	// know about, it should refuse to mount the filesystem.
-	// 
+	//
 	// e2fsck's requirements are more strict; if it doesn't know
 	// about a feature in either the compatible or incompatible
 	// feature set, it must abort and not try to meddle with
@@ -76,7 +76,7 @@ pub const Ext2Super = struct {
     data: Ext2SuperData,
     bgdt: []BGDT,
     base: fs.SuperBlock,
-    
+
     pub fn allocInode(_: *fs.SuperBlock) !*fs.Inode {
         return error.NotImplemented;
     }
@@ -161,7 +161,7 @@ pub const Ext2Super = struct {
 
         // Array as big as block_size
         const map = try self.readBlocks(bgdt_e.bg_block_bitmap, 1);
-        defer kernel.mm.kfree(map.ptr);
+        defer kernel.mm.vfree(map.ptr);
         for (0..self.base.block_size) |idx| {
             var byte: u8 = map[idx];
             if (byte == 0xFF)
@@ -212,7 +212,7 @@ pub const Ext2Super = struct {
         const offset: u32 = byte_off % self.base.block_size;
 
         var block_buff = try self.readBlocks(block, 1);
-        defer kernel.mm.kfree(block_buff.ptr);
+        defer kernel.mm.vfree(block_buff.ptr);
 
         const src = &self.bgdt[entry_idx];
         @memcpy(
@@ -229,8 +229,8 @@ pub const Ext2Super = struct {
 
     pub fn readBlocks(sb: *Ext2Super, block: usize, count: usize) ![]u8 {
         const alloc_size: usize = sb.base.block_size * count;
-        if (kernel.mm.kmallocArray(u8, alloc_size)) |raw_buff| {
-            errdefer kernel.mm.kfree(raw_buff);
+        if (kernel.mm.vmallocArray(u8, alloc_size)) |raw_buff| {
+            errdefer kernel.mm.vfree(raw_buff);
             @memset(raw_buff[0..alloc_size], 0);
             arch.cpu.disableInterrupts();
             defer arch.cpu.enableInterrupts();
@@ -262,6 +262,8 @@ pub const Ext2Super = struct {
         offset: usize
     ) !usize {
         var to_write: usize = size;
+        arch.cpu.disableInterrupts();
+        defer arch.cpu.enableInterrupts();
         sb.base.dev_file.?.pos = sb.base.block_size * block + offset;
         var written: usize = 0;
         while (written < size) {
@@ -311,7 +313,7 @@ pub const Ext2Super = struct {
             if (indirect_block == 0) return 0; // hole
 
             const buf = try ext2_sb.readBlocks(indirect_block, 1);
-            defer kernel.mm.kfree(buf.ptr);
+            defer kernel.mm.vfree(buf.ptr);
 
             // treat buf as array of u32
             const u32_ptr: [*]u32 = @ptrCast(@alignCast(buf.ptr));
@@ -338,7 +340,7 @@ pub const Ext2Super = struct {
 
             // read double-indirect block (contains ptrs to indirect blocks)
             const dbl_buf = try ext2_sb.readBlocks(dbl_block, 1);
-            defer kernel.mm.kfree(dbl_buf.ptr);
+            defer kernel.mm.vfree(dbl_buf.ptr);
             const dbl_u32_ptr: [*]u32 = @ptrCast(@alignCast(dbl_buf.ptr));
             const dbl_slice_len = dbl_buf.len / 4;
             if (first_index >= dbl_slice_len) return kernel.errors.PosixError.EINVAL;
@@ -347,7 +349,7 @@ pub const Ext2Super = struct {
 
             // read the indirect block pointed to by double-indirect
             const ind_buf = try ext2_sb.readBlocks(indirect_block_num, 1);
-            defer kernel.mm.kfree(ind_buf.ptr);
+            defer kernel.mm.vfree(ind_buf.ptr);
             const ind_u32_ptr: [*]u32 = @ptrCast(@alignCast(ind_buf.ptr));
             const ind_slice_len = ind_buf.len / 4;
             if (second_index >= ind_slice_len) return kernel.errors.PosixError.EINVAL;
@@ -364,7 +366,7 @@ pub const Ext2Super = struct {
                 try ext2_sb.readBlocks(trpl_block, 1)
             ));
 
-            defer kernel.mm.kfree(trpl_ind_buf.ptr);
+            defer kernel.mm.vfree(trpl_ind_buf.ptr);
 
             const rel = lbn - trpl_start;
             const rem: u32 = @intCast(rel % (ptrs_per_block * ptrs_per_block));
@@ -382,7 +384,7 @@ pub const Ext2Super = struct {
             const dbl_ind_buf: []u32 = @ptrCast(@alignCast(
                 try ext2_sb.readBlocks(dbl_indirect_block_num, 1)
             ));
-            defer kernel.mm.kfree(dbl_ind_buf.ptr);
+            defer kernel.mm.vfree(dbl_ind_buf.ptr);
 
             if (second_index >= dbl_ind_buf.len) {
                 return kernel.errors.PosixError.EINVAL;
@@ -393,7 +395,7 @@ pub const Ext2Super = struct {
             const ind_buf: []u32 = @ptrCast(@alignCast(
                 try ext2_sb.readBlocks(indirect_block_num, 1)
             ));
-            defer kernel.mm.kfree(ind_buf.ptr);
+            defer kernel.mm.vfree(ind_buf.ptr);
 
             if (third_index >= ind_buf.len) {
                 return kernel.errors.PosixError.EINVAL;
@@ -478,7 +480,7 @@ pub const Ext2Super = struct {
         const indirect_block = ino.data.i_block[12];
         if (indirect_block != 0) {
             const buf = try self.readBlocks(indirect_block, 1);
-            defer kernel.mm.kfree(buf.ptr);
+            defer kernel.mm.vfree(buf.ptr);
             const u32_ptr: [*]u32 = @ptrCast(@alignCast(buf.ptr));
             const slice_len = buf.len / 4;
             const slice: []const u32 = u32_ptr[0..slice_len];
@@ -506,7 +508,7 @@ pub const Ext2Super = struct {
         const dbl_block = ino.data.i_block[13];
         if (dbl_block != 0) {
             const dbl_buf = try self.readBlocks(dbl_block, 1);
-            defer kernel.mm.kfree(dbl_buf.ptr);
+            defer kernel.mm.vfree(dbl_buf.ptr);
             const dbl_u32_ptr: [*]u32 = @ptrCast(@alignCast(dbl_buf.ptr));
             const dbl_slice_len = dbl_buf.len / 4;
             for (0..dbl_slice_len) |dbl_idx| {
@@ -516,7 +518,7 @@ pub const Ext2Super = struct {
                     continue ;
 
                 const ind_buf = try self.readBlocks(indirect_block_num, 1);
-                defer kernel.mm.kfree(ind_buf.ptr);
+                defer kernel.mm.vfree(ind_buf.ptr);
                 const ind_u32_ptr: [*]u32 = @ptrCast(@alignCast(ind_buf.ptr));
                 const ind_slice_len = ind_buf.len / 4;
                 for (0..ind_slice_len) |idx| {
@@ -550,7 +552,7 @@ pub const Ext2Super = struct {
         const trpl_ind_buf: []u32 = @ptrCast(@alignCast(
             try self.readBlocks(trpl_block, 1)
         ));
-        defer kernel.mm.kfree(trpl_ind_buf.ptr);
+        defer kernel.mm.vfree(trpl_ind_buf.ptr);
         for (0..trpl_ind_buf.len) |first_idx| {
             const dbl_indirect_block_num = trpl_ind_buf[first_idx];
             if (dbl_indirect_block_num == 0)
@@ -559,7 +561,7 @@ pub const Ext2Super = struct {
             const dbl_ind_buf: []u32 = @ptrCast(@alignCast(
                 try self.readBlocks(dbl_indirect_block_num, 1)
             ));
-            defer kernel.mm.kfree(dbl_ind_buf.ptr);
+            defer kernel.mm.vfree(dbl_ind_buf.ptr);
             for (0..dbl_ind_buf.len) |second_idx| {
                 const indirect_block_num = dbl_ind_buf[second_idx];
                 if (indirect_block_num == 0)
@@ -568,7 +570,7 @@ pub const Ext2Super = struct {
                 const ind_buf: []u32 = @ptrCast(@alignCast(
                     try self.readBlocks(indirect_block_num, 1)
                 ));
-                defer kernel.mm.kfree(ind_buf.ptr);
+                defer kernel.mm.vfree(ind_buf.ptr);
                 for (0..ind_buf.len) |third_idx| {
                     const block = ind_buf[third_idx];
                     if (block != 0) {
@@ -605,7 +607,7 @@ pub const Ext2Super = struct {
         const bitmap_bit: u8 = @intCast(block_idx % 8);
         var bgd = &self.bgdt[bgdt_idx];
         const block_bitmap = try self.readBlocks(bgd.bg_block_bitmap, 1);
-        defer kernel.mm.kfree(block_bitmap.ptr);
+        defer kernel.mm.vfree(block_bitmap.ptr);
         var current_byte = block_bitmap[bitmap_byte];
         const mask: u8 = ~(@as(u8, 1) << @intCast(bitmap_bit));
         if (current_byte & ~mask == 0)
@@ -613,8 +615,8 @@ pub const Ext2Super = struct {
         current_byte = current_byte & mask;
         block_bitmap[bitmap_byte] = current_byte;
         _ = try self.writeBuff(
-            bgd.bg_block_bitmap, 
-            block_bitmap.ptr, 
+            bgd.bg_block_bitmap,
+            block_bitmap.ptr,
             block_bitmap.len
         );
         self.data.s_free_blocks_count += 1;
@@ -630,13 +632,18 @@ pub const Ext2Super = struct {
             return ;
         }
 
+        base.ref.unref();
+        while (!base.ref.isFree()) {
+            arch.archReschedule();
+        }
+
         // Inode Bitmap
         const bgdt_idx = (base.i_no - 1) / ext2_sb.data.s_inodes_per_group;
         const bgdt_entry = &ext2_sb.bgdt[bgdt_idx];
         const inode_index = (base.i_no - 1) % ext2_sb.data.s_inodes_per_group;
 
         const bgdt_bitmap_slice = try ext2_sb.readBlocks(bgdt_entry.bg_inode_bitmap, 1);
-        defer kernel.mm.kfree(bgdt_bitmap_slice.ptr);
+        defer kernel.mm.vfree(bgdt_bitmap_slice.ptr);
 
         const bit = (base.i_no - 1) % ext2_sb.data.s_inodes_per_group;
         const byte = bit >> 3;
@@ -659,7 +666,7 @@ pub const Ext2Super = struct {
         const size = @sizeOf(Ext2InodeData);
 
         const bgdt_inode_slice = try ext2_sb.readBlocks(block, 1);
-        defer kernel.mm.kfree(bgdt_inode_slice.ptr);
+        defer kernel.mm.vfree(bgdt_inode_slice.ptr);
 
         rel_offset &= (ext2_sb.base.block_size - 1);
         @memset(bgdt_inode_slice[rel_offset..rel_offset + size], 0);

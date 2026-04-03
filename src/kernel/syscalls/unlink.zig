@@ -17,6 +17,8 @@ fn do_unlinkat(dirfd: i32, _path: ?[*:0]u8) !u32 {
     } else if (dirfd == fs.AT_FDCWD) {
         from = krn.task.current.fs.pwd.clone();
     } else if (krn.task.current.files.fds.get(@intCast(dirfd))) |file| {
+        file.ref.ref();
+        defer file.ref.unref();
         if (file.path) |file_path| {
             from = file_path.clone();
             errdefer from.release();
@@ -38,11 +40,12 @@ fn do_unlinkat(dirfd: i32, _path: ?[*:0]u8) !u32 {
         return errors.EPERM;
     }
     const target = try parent.dentry.inode.ops.lookup(parent.dentry, last_segment);
+    defer target.release();
     if (target.inode.mode.isDir()) {
         return errors.EISDIR;
     }
 
-    if (from.dentry.inode.ops.unlink) |_unlink| {
+    if (parent.dentry.inode.ops.unlink) |_unlink| {
         // Dentry handling
         const key = fs.DentryHash{
             .name = last_segment,
@@ -56,7 +59,6 @@ fn do_unlinkat(dirfd: i32, _path: ?[*:0]u8) !u32 {
         parent.dentry.ref.unref();
         target.tree.del();
         target.tree.parent = null;
-        target.release();
         return 0;
     } else {
         return errors.EPERM;

@@ -317,6 +317,7 @@ pub const arch = struct {
             size : u64,
             begin : u32,
             end : u32,
+            used_pages : u32,
         };
 
     };
@@ -324,23 +325,12 @@ pub const arch = struct {
     pub const idt = struct {
         pub extern fn exceptionHandler(*arch.Regs)*arch.Regs;
         pub extern fn irqHandler(*arch.Regs)*arch.Regs;
+        pub extern fn processSignalsHelper(*arch.Regs, i32)*arch.Regs;
     };
 
     pub const fpu = struct {
         pub const FPUState = extern struct {
-            control : u16,
-            _reserved1 : u16,
-            status : u16,
-            _reserved2 : u16,
-            tag : u16,
-            _reserved3 : u16,
-            fip : u32,
-            fcs : u16,
-            _reserved4 : u16,
-            fdp : u32,
-            fds : u16,
-            _reserved5 : u16,
-            st : [8][10]u8,
+            raw : [527]u8,
         };
 
     };
@@ -405,7 +395,223 @@ pub const arch = struct {
 
     };
 
+    pub const cpuid = struct {
+        pub const Result = struct {
+            eax : u32,
+            ebx : u32,
+            ecx : u32,
+            edx : u32,
+        };
+
+        pub const Leaf1EdxFeatures = packed struct {
+            fpu : bool= false,
+            vme : bool= false,
+            de : bool= false,
+            pse : bool= false,
+            tsc : bool= false,
+            msr : bool= false,
+            pae : bool= false,
+            mce : bool= false,
+            cx8 : bool= false,
+            apic : bool= false,
+            _edx_10 : bool= false,
+            sep : bool= false,
+            mtrr : bool= false,
+            pge : bool= false,
+            mca : bool= false,
+            cmov : bool= false,
+            pat : bool= false,
+            pse36 : bool= false,
+            psn : bool= false,
+            clfsh : bool= false,
+            _edx_20 : bool= false,
+            ds : bool= false,
+            acpi : bool= false,
+            mmx : bool= false,
+            fxsr : bool= false,
+            sse : bool= false,
+            sse2 : bool= false,
+            ss : bool= false,
+            htt : bool= false,
+            tm : bool= false,
+            ia64 : bool= false,
+            pbe : bool= false,
+        };
+
+        pub const Leaf1EcxFeatures = packed struct {
+            sse3 : bool= false,
+            pclmulqdq : bool= false,
+            dtes64 : bool= false,
+            monitor : bool= false,
+            ds_cpl : bool= false,
+            vmx : bool= false,
+            smx : bool= false,
+            est : bool= false,
+            tm2 : bool= false,
+            ssse3 : bool= false,
+            cnxt_id : bool= false,
+            sdbg : bool= false,
+            fma : bool= false,
+            cx16 : bool= false,
+            xtpr : bool= false,
+            pdcm : bool= false,
+            _ecx_16 : bool= false,
+            pcid : bool= false,
+            dca : bool= false,
+            sse4_1 : bool= false,
+            sse4_2 : bool= false,
+            x2apic : bool= false,
+            movbe : bool= false,
+            popcnt : bool= false,
+            tsc_deadline : bool= false,
+            aes : bool= false,
+            xsave : bool= false,
+            osxsave : bool= false,
+            avx : bool= false,
+            f16c : bool= false,
+            rdrand : bool= false,
+            hypervisor : bool= false,
+        };
+
+        pub const Leaf7EbxFeatures = packed struct {
+            fsgsbase : bool= false,
+            ia32_tsc_adjust : bool= false,
+            sgx : bool= false,
+            bmi1 : bool= false,
+            hle : bool= false,
+            avx2 : bool= false,
+            fdp_excptn_only : bool= false,
+            smep : bool= false,
+            bmi2 : bool= false,
+            erms : bool= false,
+            invpcid : bool= false,
+            rtm : bool= false,
+            pqm : bool= false,
+            fpucsds_deprec : bool= false,
+            mpx : bool= false,
+            pqe : bool= false,
+            avx512f : bool= false,
+            avx512dq : bool= false,
+            rdseed : bool= false,
+            adx : bool= false,
+            smap : bool= false,
+            avx512_ifma : bool= false,
+            pcommit : bool= false,
+            clflushopt : bool= false,
+            clwb : bool= false,
+            intel_pt : bool= false,
+            avx512pf : bool= false,
+            avx512er : bool= false,
+            avx512cd : bool= false,
+            sha : bool= false,
+            avx512bw : bool= false,
+            avx512vl : bool= false,
+        };
+
+        pub const Leaf7EcxFeatures = packed struct {
+            prefetchwt1 : bool= false,
+            avx512_vbmi : bool= false,
+            umip : bool= false,
+            pku : bool= false,
+            ospke : bool= false,
+            waitpkg : bool= false,
+            avx512_vbmi2 : bool= false,
+            cet_ss : bool= false,
+            gfni : bool= false,
+            vaes : bool= false,
+            vpclmulqdq : bool= false,
+            avx512_vnni : bool= false,
+            avx512_bitalg : bool= false,
+            tme_en : bool= false,
+            avx512_vpopcntdq : bool= false,
+            _ecx_15 : bool= false,
+            la57 : bool= false,
+            mawau0 : bool= false,
+            mawau1 : bool= false,
+            mawau2 : bool= false,
+            mawau3 : bool= false,
+            mawau4 : bool= false,
+            rdpid : bool= false,
+            kl : bool= false,
+            bus_lock_detect : bool= false,
+            cldemote : bool= false,
+            _ecx_26 : bool= false,
+            movdiri : bool= false,
+            movdir64b : bool= false,
+            enqcmd : bool= false,
+            sgx_lc : bool= false,
+            pks : bool= false,
+        };
+
+        pub const Leaf7EdxFeatures = packed struct {
+            _edx_0 : bool= false,
+            _edx_1 : bool= false,
+            avx512_4vnniw : bool= false,
+            avx512_4fmaps : bool= false,
+            fsrm : bool= false,
+            uintr : bool= false,
+            _edx_6 : bool= false,
+            _edx_7 : bool= false,
+            avx512_vp2inters : bool= false,
+            srbds_ctrl : bool= false,
+            md_clear : bool= false,
+            rtm_always_abort : bool= false,
+            _edx_12 : bool= false,
+            tsx_force_abort : bool= false,
+            serialize : bool= false,
+            hybrid : bool= false,
+            tsxldtrk : bool= false,
+            _edx_17 : bool= false,
+            pconfig : bool= false,
+            arch_lbr : bool= false,
+            cet_ibt : bool= false,
+            _edx_21 : bool= false,
+            amx_bf16 : bool= false,
+            avx512_fp16 : bool= false,
+            amx_tile : bool= false,
+            amx_int8 : bool= false,
+            ibrs_ibpb : bool= false,
+            stibp : bool= false,
+            l1d_flush : bool= false,
+            ia32_arch_cap : bool= false,
+            ia32_core_cap : bool= false,
+            ssbd : bool= false,
+        };
+
+        pub const Leaf1Features = struct {
+            edx : arch.cpuid.Leaf1EdxFeatures,
+            ecx : arch.cpuid.Leaf1EcxFeatures,
+        };
+
+        pub const Leaf7Features = struct {
+            ebx : arch.cpuid.Leaf7EbxFeatures,
+            ecx : arch.cpuid.Leaf7EcxFeatures,
+            edx : arch.cpuid.Leaf7EdxFeatures,
+        };
+
+        pub const Info = struct {
+            supported : bool= false,
+            max_basic_leaf : u32= 0,
+            max_extended_leaf : u32= 0,
+            vendor : [12]u8,
+            brand : [48]u8,
+            features : arch.cpuid.Leaf1Features,
+            ext_features : arch.cpuid.Leaf7Features,
+        };
+
+    };
+
     pub const syscalls = struct {
+        pub const thread = struct {
+            pub const UserDesc = extern struct {
+                entry_number : i32,
+                base_addr : u32,
+                limit : u32,
+                bits : std.syscalls.thread.UserDescBits,
+            };
+
+        };
+
     };
 
 };
@@ -493,7 +699,7 @@ pub const kernel = struct {
     };
 
     pub const irq = struct {
-        pub extern fn registerHandler(u32, *const anyopaque)void;
+        pub extern fn registerHandler(u32, *const anyopaque, ?*anyopaque)void;
         pub extern fn unregisterHandler(u32)void;
     };
 
@@ -578,6 +784,11 @@ pub const kernel = struct {
     };
 
     pub const wq = struct {
+        pub const WaitQueueNode = struct {
+            task : *kernel.task.Task,
+            list : kernel.list.ListHead,
+        };
+
         pub const WaitQueueHead = struct {
             list : kernel.list.ListHead,
             lock : kernel.Spinlock,
@@ -607,24 +818,30 @@ pub const kernel = struct {
         };
 
         pub const Task = struct {
-            pid : u32,
+            pid : u16,
             tsktype : kernel.task.TaskType,
             name : [16]u8,
             uid : u16,
             gid : u16,
+            groups : [32]u16,
+            groups_count : u8= 0,
             pgid : u16= 1,
+            sid : u16= 1,
+            ctty : ?*kernel.fs.file.File= null,
             stack_bottom : u32,
             state : kernel.task.TaskState,
             regs : arch.Regs,
             tls : u32= 0,
             limit : u32= 0,
-            fpu_state : arch.fpu.FPUState,
+            fpu_state : ?*arch.fpu.FPUState= null,
             fpu_used : bool= false,
             save_fpu_state : bool= false,
             tree : kernel.tree.TreeNode,
             list : kernel.list.ListHead,
             refcount : kernel.task.RefCount,
             wakeup_time : u32= 0,
+            utime : u32= 0,
+            stime : u32= 0,
             mm : ?*kernel.mm.proc_mm.MM= null,
             fs : *kernel.fs.FSInfo,
             files : *kernel.fs.file.TaskFiles,
@@ -726,6 +943,12 @@ pub const kernel = struct {
     };
 
     pub const jiffies = struct {
+        pub const CpuTicks = struct {
+            user : u64,
+            system : u64,
+            idle : u64,
+        };
+
     };
 
     pub const errors = struct {
@@ -886,7 +1109,7 @@ pub const kernel = struct {
                 read : *const fn(*kernel.fs.file.File, [*]u8, u32) anyerror!u32,
                 lseek : ?*const fn(*kernel.fs.file.File, i32, u32) anyerror!u32= null,
                 readdir : ?*const fn(*kernel.fs.file.File, []u8) anyerror!u32= null,
-                ioctl : ?*const fn(*kernel.fs.file.File, u32, ?*anyopaque) anyerror!u32= null,
+                ioctl : ?*const fn(*kernel.fs.file.File, u32, u32) anyerror!u32= null,
                 poll : ?*const fn(*kernel.fs.file.File, *kernel.poll.PollFd) anyerror!u32= null,
             };
 
@@ -1036,6 +1259,34 @@ pub const kernel = struct {
         };
 
         pub const clone = struct {
+            pub const CloneFlags = packed struct {
+                sigmask : u8= 0,
+                VM : bool= false,
+                FS : bool= false,
+                FILES : bool= false,
+                SIGHAND : bool= false,
+                PIDFD : bool= false,
+                PTRACE : bool= false,
+                VFORK : bool= false,
+                PARENT : bool= false,
+                THREAD : bool= false,
+                NEWNS : bool= false,
+                SYSVSEM : bool= false,
+                SETTLS : bool= false,
+                PARENT_SETTID : bool= false,
+                CHILD_CLEARTID : bool= false,
+                DETACHED : bool= false,
+                UNTRACED : bool= false,
+                CHILD_SETTID : bool= false,
+                NEWCGROUP : bool= false,
+                NEWUTS : bool= false,
+                NEWIPC : bool= false,
+                NEWUSER : bool= false,
+                NEWPID : bool= false,
+                NEWNET : bool= false,
+                IO : bool= false,
+            };
+
         };
 
         pub const close = struct {
@@ -1107,7 +1358,7 @@ pub const kernel = struct {
 
         pub const read = struct {
             pub const IoVec = extern struct {
-                base : [*]u8,
+                base : ?[*]u8,
                 len : u32,
             };
 
@@ -1246,7 +1497,26 @@ pub const kernel = struct {
 
 pub const debug = struct {
     pub const Logger = struct {
-        log_level : std.logger.LogLevel,
+        log_level : debug.log.LogLevel,
+    };
+
+    pub const log = struct {
+        pub const LogLevel = enum(u3) {
+            DEBUG = 0,
+            INFO = 1,
+            WARN = 2,
+            ERROR = 3,
+            OFF = 4,
+        };
+
+
+        pub const LogDestination = enum(u1) {
+            SERIAL = 0,
+            SCREEN = 1,
+        };
+
+
+
     };
 
 };
@@ -1513,7 +1783,6 @@ pub const drivers = struct {
                 current_op : std.storage.ata.ATA_Operation,
                 status : std.storage.ata.ATA_Status,
                 device_cmd : u8= 0,
-                buffer : []u8,
                 lba28 : u32= 0,
                 lba48 : u64= 0,
                 drive : u8= 0,
@@ -1628,9 +1897,13 @@ pub const drivers = struct {
 
         pub const serial = struct {
             pub const Serial = struct {
-                addr : u16,
+                addr : u16= 0,
+                wait_queue : kernel.wq.WaitQueueHead,
             };
 
+        };
+
+        pub const nulldev = struct {
         };
 
         pub const tty = struct {
@@ -1644,7 +1917,7 @@ pub const drivers = struct {
                 term : std.platform.termios.Termios,
                 winsz : std.platform.tty_struct.WinSize,
                 file_buff : kernel.ringbuf.RingBuf,
-                lock : kernel.Mutex,
+                lock : kernel.Spinlock,
                 nonblock : bool= false,
                 read_queue : kernel.wq.WaitQueueHead,
                 session_id : i32= 1,
@@ -1653,6 +1926,9 @@ pub const drivers = struct {
                 vt_index : u16= 1,
                 vt_active : bool= true,
                 kd_mode : u32= 0,
+                backend : std.platform.tty_struct.Backend,
+                backend_ops : std.platform.tty_struct.BackendOps,
+                backend_data : ?*anyopaque= null,
                 _input_len : u32= 0,
                 tab_len : u32= 8,
                 saved_x : u32= 0,
@@ -1773,7 +2049,7 @@ pub const api = struct {
     pub extern fn restoreKBD()void;
     pub extern fn setCMOS(*drivers.cmos.CMOS)void;
     pub extern fn restoreCMOS()void;
-    pub extern fn registerHandler(u32, *const anyopaque)void;
+    pub extern fn registerHandler(u32, *const anyopaque, ?*anyopaque)void;
     pub extern fn unregisterHandler(u32)void;
     pub extern fn module_panic([*]const u8, u32)void;
 };

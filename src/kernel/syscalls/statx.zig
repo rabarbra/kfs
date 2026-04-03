@@ -125,7 +125,7 @@ pub fn statx(dirfd: i32, path: ?[*:0]u8, flags: u32, mask: u32, statxbuf: ?*Stat
     const path_s: []const u8 = std.mem.span(path.?);
     if (dirfd != fs.AT_FDCWD and dirfd < 0)
         return errors.EBADF;
-    krn.logger.WARN(
+    krn.logger.INFO(
         "statx {s} in {d} flags: {x}, mask: {x}, buf addr: {x}",
         .{path_s, dirfd, flags, mask, @intFromPtr(statxbuf)}
     );
@@ -134,6 +134,8 @@ pub fn statx(dirfd: i32, path: ?[*:0]u8, flags: u32, mask: u32, statxbuf: ?*Stat
             return errors.EFAULT;
         }
         if (krn.task.current.files.fds.get(@intCast(dirfd))) |file| {
+            file.ref.ref();
+            defer file.ref.unref();
             return try do_statx(file.inode, statxbuf.?);
         }
         return errors.EBADF;
@@ -144,11 +146,14 @@ pub fn statx(dirfd: i32, path: ?[*:0]u8, flags: u32, mask: u32, statxbuf: ?*Stat
         if (dirfd == fs.AT_FDCWD) {
 
         } else if (krn.task.current.files.fds.get(@intCast(dirfd))) |file| {
+            file.ref.ref();
+            defer file.ref.unref();
             if (!file.inode.mode.isDir())
                 return errors.ENOTDIR;
             if (file.path == null)
                 return errors.EINVAL;
-            from_path = file.path.?;
+            from_path.release();
+            from_path = file.path.?.clone();
         } else {
             return errors.EBADF;
         }

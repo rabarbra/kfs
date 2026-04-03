@@ -8,13 +8,12 @@ const std = @import("std");
 
 
 const PAGE_SIZE = @import("arch").PAGE_SIZE;
-pub const STACK_PAGES = 3;
+pub const STACK_PAGES = 5;
 pub const STACK_SIZE: u32 = (STACK_PAGES - 1) * PAGE_SIZE;
 
 pub const ThreadHandler = *const fn (arg: ?*const anyopaque) i32;
 
 fn threadWrapper() callconv(.c) noreturn {
-    tsk.current.refcount.ref();
     tsk.current.result = tsk.current.threadfn.?(tsk.current.arg);
     tsk.current.finish(false);
     krn.sched.reschedule();
@@ -22,12 +21,18 @@ fn threadWrapper() callconv(.c) noreturn {
 }
 
 pub fn kthreadStackAlloc(num_of_pages: usize) usize {
+    const lock_state = krn.mm.mem_lock.lock_irq_disable();
+    defer krn.mm.mem_lock.unlock_irq_enable(lock_state);
+
     const stack: usize = mm.virt_memory_manager.findFreeSpace(
         num_of_pages,
         mm.PAGE_OFFSET,
         0xFFFFF000,
         false
     );
+    if (stack == 0xFFFFFFFF)
+        return 0;
+
     for (0..num_of_pages) |index| {
         const page: usize = mm.virt_memory_manager.pmm.allocPage();
         if (page == 0) {
@@ -45,13 +50,14 @@ pub fn kthreadStackAlloc(num_of_pages: usize) usize {
 }
 
 pub fn kthreadStackFree(addr: usize) void {
+    const lock_state = krn.mm.mem_lock.lock_irq_disable();
+    defer krn.mm.mem_lock.unlock_irq_enable(lock_state);
+
     var page: usize = addr - PAGE_SIZE; // RO page
-    mm.virt_memory_manager.unmapPage(page, true);
-    page += PAGE_SIZE;
-    mm.virt_memory_manager.unmapPage(page, true);
-    page += PAGE_SIZE;
-    mm.virt_memory_manager.unmapPage(page, true);
-    page += PAGE_SIZE;
+    for (0..STACK_PAGES) |_| {
+        mm.virt_memory_manager.unmapPage(page, true);
+        page += PAGE_SIZE;
+    }
 }
 
 pub fn kthreadCreate(f: ThreadHandler, arg: ?*const anyopaque, name: [*:0]const u8) !*tsk.Task {
@@ -74,6 +80,7 @@ pub fn kthreadCreate(f: ThreadHandler, arg: ?*const anyopaque, name: [*:0]const 
         task.arg = arg;
         task.mm = &mm.proc_mm.init_mm;
         task.fs = krn.task.initial_task.fs;
+        try task.assignPID();
         task.initSelf(
             stack_top,
             stack,

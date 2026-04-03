@@ -41,7 +41,11 @@ pub const ProcInode = struct {
             .ino = dir.inode.i_no,
             .name = name,
         };
+            
+        fs.dcache_lock.lock();
+        defer fs.dcache_lock.unlock();
         if (fs.dcache.get(key)) |entry| {
+            entry.ref.ref();
             return entry;
         }
         return kernel.errors.PosixError.ENOENT;
@@ -66,23 +70,34 @@ pub const ProcInode = struct {
         new_inode.links = 2;
         errdefer kernel.mm.kfree(new_inode);
         var new_dentry = try fs.DEntry.alloc(name, sb, new_inode);
+        new_dentry.ref.ref();
         errdefer kernel.mm.kfree(new_dentry);
         parent.inode.links += 1;
         parent.tree.addChild(&new_dentry.tree);
         parent.ref.ref();
         cash_key.name = new_dentry.name;
+        fs.dcache_lock.lock();
+        defer fs.dcache_lock.unlock();
         try fs.dcache.put(cash_key, new_dentry);
         return new_dentry;
     }
 
     fn rmdir(current: *fs.DEntry, parent: *fs.DEntry) !void {
-        _ = if (current.inode.sb) |_s| _s else return kernel.errors.PosixError.EINVAL;
-        if (current.tree.hasChildren())
+        _ = if (current.inode.sb) |_s| _s else
+            return kernel.errors.PosixError.EINVAL;
+        fs.dcache_lock.lock();
+        if (current.tree.hasChildren()) {
+            fs.dcache_lock.unlock();
             return kernel.errors.PosixError.ENOTEMPTY;
-        if (current.ref.getValue() > 2)
+        }
+        if (current.ref.getValue() > 2) {
+            fs.dcache_lock.unlock();
             return kernel.errors.PosixError.EBUSY;
+        }
+        fs.dcache_lock.unlock();
 
         parent.inode.links -= 1;
+        current.inode.links = 0;
         current.release();
         current.release();
     }
@@ -93,8 +108,12 @@ pub const ProcInode = struct {
         if (_dentry.inode.mode.isDir())
             return kernel.errors.PosixError.EISDIR;
 
-        if (_dentry.ref.getValue() > 2)
+        fs.dcache_lock.lock();
+        if (_dentry.ref.getValue() > 2) {
+            fs.dcache_lock.unlock();
             return kernel.errors.PosixError.EBUSY;
+        }
+        fs.dcache_lock.unlock();
 
         _dentry.inode.links -= 1;
         _dentry.release();
@@ -110,7 +129,7 @@ pub const ProcInode = struct {
         // we don't need to check. This should happen only for userspace
 
         // Lookup if file already exists.
-        _ = base.ops.lookup(parent, name) catch {
+        const dent = base.ops.lookup(parent, name) catch {
             const new_inode = try ProcInode.new(sb);
             errdefer kernel.mm.kfree(new_inode);
             new_inode.setCreds(
@@ -125,6 +144,7 @@ pub const ProcInode = struct {
             }
             return dent;
         };
+        dent.release();
         return kernel.errors.PosixError.EEXIST;
     }
 
@@ -146,6 +166,10 @@ pub const ProcInode = struct {
 
     pub fn deinit(self: *ProcInode) void {
         if (self.base.links == 0) {
+            if (self.task) |t| {
+                t.refcount.unref();
+                self.task = null;
+            }
             kernel.mm.kfree(self);
         }
     }

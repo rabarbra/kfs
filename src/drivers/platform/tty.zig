@@ -1,6 +1,5 @@
 const std = @import("std");
 const krn = @import("kernel");
-const io = @import("arch").io;
 const scr = @import("../screen.zig");
 const kbd = @import("../kbd.zig");
 
@@ -9,6 +8,7 @@ const cdev = @import("../cdev.zig");
 
 const pdev = @import("./device.zig");
 const pdrv = @import("./driver.zig");
+const serial = @import("./serial.zig");
 
 const t = @import("./termios.zig");
 const tty = @import("./tty_struct.zig");
@@ -73,15 +73,59 @@ var tty_file_ops = krn.fs.FileOps{
     .poll = tty_poll,
 };
 
+const MAX_VTS: usize = 10;
+
+var vt_ttys: [MAX_VTS]?*TTY = [_]?*TTY{null} ** MAX_VTS;
+
+fn registerVT(vt_idx: u16, tty_dev: *TTY) void {
+    if (vt_idx == 0 or vt_idx > MAX_VTS)
+        return;
+    vt_ttys[vt_idx - 1] = tty_dev;
+}
+
+fn getVT(vt_idx: u16) ?*TTY {
+    if (vt_idx == 0 or vt_idx > MAX_VTS)
+        return null;
+    return vt_ttys[vt_idx - 1];
+}
+
+fn flushInputQueue(_tty: *TTY) void {
+    _tty.lock.lock();
+    _ = _tty.file_buff.reset();
+    _tty.lock.unlock();
+}
+
+fn isControllingTTY(file: *krn.fs.File) bool {
+    if (file.path) |path|
+        return std.mem.eql(u8, path.dentry.name, "tty");
+    return false;
+}
+
 // file ops
 fn getTTY(file: *krn.fs.File) !*TTY {
+    if (isControllingTTY(file)) {
+        const ctty_file = krn.task.current.controllingTTY() orelse
+            return krn.errors.PosixError.ENXIO;
+        if (ctty_file == file)
+            return krn.errors.PosixError.ENXIO;
+        if (ctty_file.inode.data.dev) |_d| {
+            return @ptrCast(@alignCast(_d.data));
+        }
+        return krn.errors.PosixError.EIO;
+    }
     if (file.inode.data.dev) |_d|
         return @ptrCast(@alignCast(_d.data));
     return krn.errors.PosixError.EIO;
 }
 
-fn tty_open(_: *krn.fs.File, _: *krn.fs.Inode) !void {
-    krn.logger.WARN("TTY file opened\n", .{});
+fn tty_open(file: *krn.fs.File, _: *krn.fs.Inode) !void {
+    _ = try getTTY(file);
+    if (
+        (file.flags & krn.fs.file.O_NOCTTY) == 0
+        and krn.task.current.controllingTTY() == null
+    ) {
+        krn.task.current.setControllingTTY(file);
+    }
 }
 
 fn tty_close(base: *krn.fs.File) void {
@@ -107,7 +151,8 @@ fn tty_read(file: *krn.fs.File, buf: [*]u8, size: usize) !usize {
             }
             _tty.lock.unlock();
             _tty.read_queue.wait(true, 0);
-
+            if (krn.task.current.sighand.hasPending())
+                return krn.errors.PosixError.EINTR;
         }
     } else {
         const vmin: u8 = _tty.term.c_cc[t.VMIN];
@@ -205,12 +250,13 @@ fn tty_write(file: *krn.fs.File, buf: [*]const u8, size: usize) !usize {
 fn tty_ioctl(
     file: *krn.fs.File,
     op: u32,
-    data: ?*anyopaque
+    data: usize
 ) !u32 {
     var _tty = try getTTY(file);
+    const data_ptr: ?*anyopaque = if (data == 0) null else @ptrFromInt(data);
     switch (op) {
         TCGETS => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 krn.logger.DEBUG("tty_ioctl TCGETS\n", .{});
                 const user_term: *t.Termios = @ptrCast(@alignCast(p));
                 user_term.* = _tty.term;
@@ -219,7 +265,7 @@ fn tty_ioctl(
             return krn.errors.PosixError.EINVAL;
         },
         TCSETS, TCSETSW, TCSETSF => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 const new_term: *const t.Termios = @ptrCast(@alignCast(p));
                 krn.logger.DEBUG("tty_ioctl TCSETS, TCSETSW, TCSETSF\n", .{});
                 _tty.term.printDiff(new_term);
@@ -247,29 +293,26 @@ fn tty_ioctl(
         },
         TCFLSH => {
             // arg: 0=flush input, 1=flush output, 2=both
-            if (data) |p| {
-                const arg: usize = @intFromPtr(p);
-                krn.logger.DEBUG("tty_ioctl TCFLSH {}\n", .{arg});
-                switch (arg & 3) {
-                    0 => {
-                        _tty.lock.lock();
-                        _ = _tty.file_buff.reset();
-                        _tty.lock.unlock();
-                    },
-                    1 => {},
-                    2 => {
-                        _tty.lock.lock();
-                        _ = _tty.file_buff.reset();
-                        _tty.lock.unlock();
-                    },
-                    else => {},
-                }
-                return 0;
+            const arg: usize = data;
+            krn.logger.DEBUG("tty_ioctl TCFLSH {}\n", .{arg});
+            switch (arg & 3) {
+                0 => {
+                    _tty.lock.lock();
+                    _ = _tty.file_buff.reset();
+                    _tty.lock.unlock();
+                },
+                1 => {},
+                2 => {
+                    _tty.lock.lock();
+                    _ = _tty.file_buff.reset();
+                    _tty.lock.unlock();
+                },
+                else => {},
             }
-            return krn.errors.PosixError.EINVAL;
+            return 0;
         },
         TIOCGWINSZ => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 krn.logger.DEBUG("tty_ioctl TIOCGWINSZ\n", .{});
                 const user_winsz: *tty.WinSize = @ptrCast(@alignCast(p));
                 user_winsz.* = _tty.winsz;
@@ -278,7 +321,7 @@ fn tty_ioctl(
             return krn.errors.PosixError.EINVAL;
         },
         TIOCSWINSZ => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 const user_winsz: *const tty.WinSize = @ptrCast(@alignCast(p));
                 _tty.winsz = user_winsz.*;
                 krn.logger.DEBUG("tty_ioctl TIOCSWINSZ new winsz: {}\n", .{_tty.winsz});
@@ -288,7 +331,7 @@ fn tty_ioctl(
             return krn.errors.PosixError.EINVAL;
         },
         TIOCINQ => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 krn.logger.DEBUG(
                     "tty_ioctl TIOCINQ, user gets: {d}\n",
                     .{_tty.file_buff.available()}
@@ -300,7 +343,7 @@ fn tty_ioctl(
             return krn.errors.PosixError.EINVAL;
         },
         TIOCOUTQ => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 krn.logger.DEBUG(
                     "tty_ioctl TIOCOUTQ, user gets: {d}\n",
                     .{0}
@@ -312,7 +355,7 @@ fn tty_ioctl(
             return krn.errors.PosixError.EINVAL;
         },
         TIOCGPGRP => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 krn.logger.DEBUG(
                     "tty_ioctl TIOCGPGRP, user gets: {d}\n",
                     .{_tty.fg_pgid}
@@ -324,7 +367,7 @@ fn tty_ioctl(
             return krn.errors.PosixError.EINVAL;
         },
         TIOCSPGRP => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 const new_pgid: i32 = @as(*i32, @ptrCast(@alignCast(p))).*;
                 _tty.fg_pgid = new_pgid;
                 krn.logger.DEBUG(
@@ -336,7 +379,7 @@ fn tty_ioctl(
             return krn.errors.PosixError.EINVAL;
         },
         TIOCGSID => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 krn.logger.DEBUG(
                     "tty_ioctl TIOCGSID, user gets {d}\n",
                     .{_tty.session_id}
@@ -348,9 +391,28 @@ fn tty_ioctl(
             return krn.errors.PosixError.EINVAL;
         },
         TIOCSCTTY => {
+            const force = data != 0;
+            if (krn.task.current.pid != krn.task.current.sid) {
+                return krn.errors.PosixError.EPERM;
+            }
+            if (
+                !force
+                and krn.task.current.controllingTTY() != null
+                and krn.task.current.controllingTTY().? != file
+            ) {
+                return krn.errors.PosixError.EPERM;
+            }
+            if (
+                !force
+                and _tty.session_id != 0
+                and _tty.session_id != krn.task.current.sid
+            ) {
+                return krn.errors.PosixError.EPERM;
+            }
             _tty.is_controlling = true;
-            _tty.session_id = @intCast(krn.task.current.pgid);
+            _tty.session_id = @intCast(krn.task.current.sid);
             _tty.fg_pgid = krn.task.current.pgid;
+            krn.task.current.setControllingTTY(file);
             krn.logger.DEBUG(
                 "tty_ioctl TIOCSCTTY: set fg_pgid to {d} (PID {d})\n",
                 .{_tty.fg_pgid, krn.task.current.pid}
@@ -360,10 +422,16 @@ fn tty_ioctl(
         TIOCNOTTY => {
             krn.logger.DEBUG("tty_ioctl TIOCNOTTY\n", .{});
             _tty.is_controlling = false;
+            if (
+                krn.task.current.controllingTTY() != null
+                and krn.task.current.controllingTTY().? == file
+            ) {
+                krn.task.current.clearControllingTTY();
+            }
             return 0;
         },
         FIONBIO => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 const user_nonblock: *i32 = @ptrCast(@alignCast(p));
                 _tty.nonblock = (user_nonblock.* != 0);
                 krn.logger.DEBUG(
@@ -376,10 +444,10 @@ fn tty_ioctl(
         },
         // VT/KD
         VT_OPENQRY => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 var next_vt: i32 = 1;
                 const current_vt = _tty.vt_index;
-                next_vt = @intCast(@mod(current_vt, 10) + 1);
+                next_vt = @intCast(@mod(current_vt, MAX_VTS) + 1);
 
                 krn.logger.DEBUG(
                     "tty_ioctl VT_OPENQRY, user gets {d}\n",
@@ -392,7 +460,7 @@ fn tty_ioctl(
             return krn.errors.PosixError.EINVAL;
         },
         VT_GETSTATE => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 krn.logger.DEBUG("tty_ioctl VT_GETSTATE\n", .{});
                 const vt_stat: *VtStat = @ptrCast(@alignCast(p));
 
@@ -418,7 +486,7 @@ fn tty_ioctl(
             return 0;
         },
         KDGETMODE => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 krn.logger.DEBUG(
                     "tty_ioctl KDGETMODE old kd_mode {d}\n",
                     .{_tty.kd_mode}
@@ -429,7 +497,7 @@ fn tty_ioctl(
             return krn.errors.PosixError.EINVAL;
         },
         KDSETMODE => {
-            if (data) |p| {
+            if (data_ptr) |p| {
                 _tty.kd_mode = @as(*u32, @ptrCast(@alignCast(p))).*;
                 krn.logger.DEBUG(
                     "tty_ioctl KDSETMODE new kd_mode: {d}\n",
@@ -463,10 +531,15 @@ fn tty_poll(base: *krn.fs.File, pollfd: *krn.poll.PollFd) !u32 {
 
 // probe / thread / init
 fn tty_probe(device: *pdev.PlatformDevice) !void {
-    if (device.dev.data == null)
+    if (
+        device.dev.data == null
+        and !std.mem.eql(u8, device.dev.name, "tty")
+    )
         return krn.errors.PosixError.EIO;
-    const cur_tty: *TTY = @ptrCast(@alignCast(device.dev.data));
-    cur_tty.clear();
+    if (device.dev.data) |data| {
+        const cur_tty: *TTY = @ptrCast(@alignCast(data));
+        cur_tty.clear();
+    }
     try cdev.addCdev(&device.dev, krn.fs.UMode.chardev());
 }
 
@@ -475,37 +548,131 @@ fn tty_remove(device: *pdev.PlatformDevice) !void {
     krn.logger.WARN("tty cannot be initialized", .{});
 }
 
-pub fn tty_thread(_: ?*const anyopaque) i32 {
+pub fn tty_serial_thread(arg: ?*const anyopaque) i32 {
+    const cur_tty: *TTY = if (arg) |_arg|
+        @ptrCast(@alignCast(@constCast(_arg)))
+    else
+        return 0;
+    const data = cur_tty.backend_data orelse
+        return 0;
+    const ser: *serial.Serial = @ptrCast(@alignCast(data));
+
     while (krn.task.current.should_stop != true) {
-        if (kbd.global_keyboard.getInput()) |input| {
-            scr.current_tty.?.input(input);
-        }
-        kbd.wait_queue.wait(false, 0);
+        _ = pollSerialTTYInput(cur_tty);
+        ser.wait_queue.wait(false, 0);
     }
     return 0;
 }
 
+pub fn tty_kbd_thread(_: ?*const anyopaque) i32 {
+    while (krn.task.current.should_stop != true) {
+        var did_work = false;
+        if (kbd.global_keyboard.getInput()) |input| {
+            var filtered: [256]kbd.KeyEvent = undefined;
+            var filtered_len: usize = 0;
+            for (input) |event| {
+                if (event.ctl) {
+                    const ctrl: kbd.CtrlType = @enumFromInt(event.val);
+                    if (isVTControlKey(ctrl)) {
+                        switchTTY(ctrl);
+                        continue;
+                    }
+                }
+                filtered[filtered_len] = event;
+                filtered_len += 1;
+            }
+            if (filtered_len > 0 and scr.current_tty != null) {
+                scr.current_tty.?.input(filtered[0..filtered_len]);
+                did_work = true;
+            }
+        }
+        if (!did_work) {
+            kbd.wait_queue.wait(false, 0);
+        }
+    }
+    return 0;
+}
+
+fn pollSerialTTYInput(cur_tty: *TTY) bool {
+    const data = cur_tty.backend_data orelse
+        return false;
+    const ser: *serial.Serial = @ptrCast(@alignCast(data));
+    var got_input = false;
+    var n: usize = 0;
+    while (n < 256 and ser.canRead()) {
+        cur_tty.inputByte(ser.getchar());
+        got_input = true;
+        n += 1;
+    }
+    return got_input;
+}
+
+fn serialTTYWriteByte(cur_tty: *TTY, b: u8) void {
+    if (cur_tty.backend_data) |data| {
+        const ser: *serial.Serial = @ptrCast(@alignCast(data));
+        ser.putchar(b);
+    }
+}
+
+fn isVTControlKey(ctrl: kbd.CtrlType) bool {
+    const ctrl_num = @intFromEnum(ctrl);
+    return (
+        ctrl_num >= @intFromEnum(kbd.CtrlType.TTY1)
+        and ctrl_num < (@intFromEnum(kbd.CtrlType.TTY1) + MAX_VTS)
+    );
+}
+
 fn addTTYDev(name: []const u8) !void {
     if (pdev.PlatformDevice.alloc(name)) |platform_tty| {
+        var serial_tty: ?*TTY = null;
+        if (std.mem.eql(u8, name, "tty")) {
+            try platform_tty.register();
+            return;
+        }
+        const is_serial_tty = (
+            name.len > 4
+            and std.mem.eql(u8, name[0..4], "ttyS")
+        );
         if (krn.mm.kmalloc(TTY)) |curr_tty| {
-            var vt_idx: u16 = 0;
-            if (name.len > 3 and std.mem.eql(u8, name[0..3], "tty")) {
-                vt_idx = std.fmt.parseInt(u16, name[3..], 10) catch 0;
+            if (is_serial_tty) {
+                const serial_idx = std.fmt.parseInt(u8, name[4..], 10)
+                    catch return krn.errors.PosixError.EINVAL;
+                const serial_dev = serial.getByIndex(serial_idx)
+                    orelse return krn.errors.PosixError.ENODEV;
+                curr_tty.* = try TTY.initSerial();
+                curr_tty.setBackendOps(.{
+                    .writeByte = serialTTYWriteByte,
+                });
+                curr_tty.backend_data = @ptrCast(serial_dev);
+                serial_tty = curr_tty;
+            } else {
+                var vt_idx: u16 = 0;
+                if (name.len > 3 and std.mem.eql(u8, name[0..3], "tty")) {
+                    vt_idx = std.fmt.parseInt(u16, name[3..], 10) catch 0;
+                }
+                curr_tty.* = try TTY.init(
+                    scr.framebuffer.cwidth,
+                    scr.framebuffer.cheight,
+                    vt_idx
+                );
+                if (scr.current_tty == null) {
+                    scr.current_tty = curr_tty;
+                }
+                registerVT(vt_idx, curr_tty);
             }
-            curr_tty.* = try TTY.init(
-                scr.framebuffer.cwidth,
-                scr.framebuffer.cheight,
-                vt_idx
-            );
             curr_tty.setup();
-            if (scr.current_tty == null) {
-                scr.current_tty = curr_tty;
-            }
             platform_tty.dev.data = @ptrCast(@alignCast(curr_tty));
         } else {
             return krn.errors.PosixError.ENOMEM;
         }
         try platform_tty.register();
+        if (is_serial_tty and serial_tty != null) {
+            _ = krn.kthreadCreate(
+                &tty_serial_thread,
+                @ptrCast(serial_tty.?),
+                "tty_serial_thread"
+            ) catch null;
+        }
         return ;
     } else {
         return krn.errors.PosixError.ENOMEM;
@@ -513,21 +680,23 @@ fn addTTYDev(name: []const u8) !void {
 }
 
 pub fn init() void {
-    // Create tty1 first so it becomes the current_tty (userspace shells use tty1-tty4)
-    addTTYDev("tty") catch |err| {
-        krn.logger.ERROR("tty1 not added: {t}", .{err});
-        return;
-    };
-    addTTYDev("tty2") catch return;
-    addTTYDev("tty3") catch return;
-    addTTYDev("tty4") catch return;
-    addTTYDev("tty5") catch return;
-    addTTYDev("tty6") catch return;
-    addTTYDev("tty7") catch return;
-    addTTYDev("tty8") catch return;
-    addTTYDev("tty9") catch return;
-    addTTYDev("tty10") catch return;
-    addTTYDev("tty1") catch return;
+    for (1..MAX_VTS) |vt| {
+        var name_buf: [8]u8 = undefined;
+        const vt_name = std.fmt.bufPrint(name_buf[0..], "tty{d}", .{vt})
+            catch continue;
+        addTTYDev(vt_name)
+            catch continue;
+    }
+
+    for (1..serial.MAX_SERIAL_PORTS, 1..) |_, ser_id| {
+        if (serial.getByIndex(ser_id)) |_| {
+            var name_buf: [8]u8 = undefined;
+            const ser_name = std.fmt.bufPrint(name_buf[0..], "ttyS{d}", .{ser_id})
+                catch continue;            
+            addTTYDev(ser_name)
+                catch continue;
+        }
+    }
 
     pdrv.platform_register_driver(&tty_driver.driver) catch |err| {
         krn.logger.ERROR("Error registering platform driver: {any}", .{err});
@@ -535,44 +704,19 @@ pub fn init() void {
     };
     krn.logger.WARN("Driver registered for tty", .{});
 
-    _ = krn.kthreadCreate(&tty_thread, null, "tty_thread") catch null;
+    _ = krn.kthreadCreate(&tty_kbd_thread, null, "tty_kbd_thread") catch null;
     return ;
 }
 
 fn switchTTY(ctrl: kbd.CtrlType) void {
     krn.logger.INFO("Switch tty {t}", .{ctrl});
-    var buff: [10]u8 = undefined;
-    const name = std.fmt.bufPrint(
-        buff[0..10],
-        "/dev/tty{d}",
-        .{@intFromEnum(ctrl) - @intFromEnum(kbd.CtrlType.TTY1) + 1}
-    ) catch |err| {
-        krn.logger.ERROR("switchTTY: {t}", .{err});
+    const vt_idx: u16 = @intCast(
+        @intFromEnum(ctrl) - @intFromEnum(kbd.CtrlType.TTY1) + 1
+    );
+    const next_tty = getVT(vt_idx) orelse {
+        krn.logger.ERROR("switchTTY: tty{d} not found", .{vt_idx});
         return;
     };
-    const path = krn.fs.path.resolve(name) catch |err| {
-        krn.logger.ERROR("switchTTY: {t}", .{err});
-        return;
-    };
-    if (!path.dentry.inode.mode.isChr()) {
-        krn.logger.ERROR("switchTTY: not char", .{});
-        return ;
-    }
-    const file = krn.fs.File.new(path) catch |err| {
-        krn.logger.ERROR("switchTTY: cannot create file: {t}", .{err});
-        return ;
-    };
-    defer file.ref.unref();
-    path.dentry.inode.fops.open(file, path.dentry.inode) catch |err| {
-        krn.logger.ERROR("switchTTY: cannot create file: {t}", .{err});
-        return ;
-    };
-    if (path.dentry.inode.data.dev) |_d| {
-        const curr_tty: *TTY = @ptrCast(@alignCast(_d.data));
-        scr.current_tty = curr_tty;
-        scr.current_tty.?.reRenderAll();
-    } else {
-        krn.logger.ERROR("switchTTY: no tty dev", .{});
-        return ;
-    }
+    scr.current_tty = next_tty;
+    next_tty.reRenderAll();
 }

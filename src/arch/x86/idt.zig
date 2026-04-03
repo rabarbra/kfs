@@ -24,7 +24,7 @@ pub const USER_DATA_SEGMENT   = 0x20;
 
 const ExceptionHandler  = fn (regs: *Regs) *Regs;
 const SyscallHandler    = fn (regs: *Regs) void;
-const ISRHandler        = fn () callconv(.c) void;
+const ISRHandler        = fn (arg: ?*anyopaque) callconv(.c) void;
 
 extern const stack_top: u32;
 
@@ -63,9 +63,11 @@ pub fn switchTo(from: *tsk.Task, to: *tsk.Task, state: *Regs) *Regs {
     from.regs = state.*;
     from.regs.setStackPointer(@intFromPtr(state));
     if (from.save_fpu_state) {
-        fpu.saveFPUState(&from.fpu_state);
+        if (from.fpu_state) |fpu_state| {
+            fpu.saveFPUState(fpu_state);
+            fpu.setTaskSwitched();
+        }
         from.save_fpu_state = false;
-        fpu.setTaskSwitched();
     }
     tsk.current = to;
     if (to == &tsk.initial_task) {
@@ -111,8 +113,6 @@ pub export fn exceptionHandler(state: *Regs) callconv(.c) *Regs {
 pub export fn irqHandler(state: *Regs) callconv(.c) *Regs {
     @setRuntimeSafety(false);
     const orig_eax = state.eax;
-    if (@intFromPtr(state) % 4 != 0)
-        krn.logger.WARN("IRQ: Unaligned stack address {x}\n", .{@intFromPtr(state)});
     var new_state: *Regs = state;
     if (krn.irq.handlers[state.int_no] != null) {
         if (state.int_no == SYSCALL_INTERRUPT) {
@@ -120,7 +120,8 @@ pub export fn irqHandler(state: *Regs) callconv(.c) *Regs {
             handler(state);
         } else {
             const handler: *const ISRHandler = @ptrCast(krn.irq.handlers[state.int_no].?);
-            handler();
+            const arg: ?*anyopaque = krn.irq.args[state.int_no];
+            handler(arg);
         }
     }
     io.outb(0x20, 0x20);
@@ -130,13 +131,52 @@ pub export fn irqHandler(state: *Regs) callconv(.c) *Regs {
     if (state.int_no == TIMER_INTERRUPT) {
         new_state = krn.sched.schedule(state);
     }
+
+    if (new_state != state) {
+        // schedule() switched to a different task. We're still on the old
+        // task's kernel stack, but tsk.current is the new task. Process
+        // signals on the new task's kernel stack so that any kernel-mode
+        // work (doExit, archReschedule, etc.) uses the correct stack.
+        new_state = processSignalsOnNewStack(new_state, orig_eax);
+    } else {
+        new_state = processSignalsHelper(new_state, orig_eax);
+    }
+
+    return new_state;
+}
+
+pub export fn processSignalsHelper(regs: *Regs, orig_eax: i32) callconv(.c) *Regs {
     if (tsk.current.tsktype != .KTHREAD) {
         var ucontext = signals.Ucontext{};
-        ucontext.setRegs(new_state, orig_eax);
+        ucontext.setRegs(regs, orig_eax);
         ucontext.mask = tsk.current.sigmask;
-        new_state = signals.processSignals(new_state, &ucontext);
+        return signals.processSignals(regs, &ucontext);
     }
-    return new_state;
+    return regs;
+}
+
+/// Switches ESP to the new task's kernel stack (at the saved Regs frame),
+/// calls processSignalsHelper there, then restores the original ESP.
+/// If processSignalsHelper never returns (doExit → reschedule), the old
+/// stack is abandoned — the old task resumes from its own saved state.
+noinline fn processSignalsOnNewStack(new_state: *Regs, orig_eax: i32) *Regs {
+    @setRuntimeSafety(false);
+    return @ptrFromInt(asm volatile (
+        \\ mov %%esp, %%ecx
+        \\ mov %%edi, %%esp
+        \\ push %%ecx
+        \\ push %%ebx
+        \\ push %%esi
+        \\ lea processSignalsHelper, %%eax
+        \\ call *%%eax
+        \\ add $8, %%esp
+        \\ pop %%esp
+        : [ret] "={eax}" (-> usize),
+        : [new_esp] "{edi}" (@intFromPtr(new_state)),
+          [regs] "{esi}" (@intFromPtr(new_state)),
+          [orig_eax] "{ebx}" (@as(u32, @bitCast(orig_eax))),
+        : .{ .memory = true }
+    ));
 }
 
 const ErrorCodes = std.EnumMap(krn.exceptions.Exceptions, bool).init(.{
@@ -198,10 +238,17 @@ pub const pop_regs: []const u8 =
 \\
 ;
 
+const kernel_entry_clear_flags: []const u8 =
+    \\    pushl $2
+    \\    popfd
+    \\
+;
+
 pub fn generateIRQStub(comptime n: u8) []const u8 {
     return std.fmt.comptimePrint(
         \\irq_stub_{d}:
         \\ cli
+        \\ {s}
         \\ push $0
         \\ push ${d}
         \\ {s}
@@ -215,7 +262,13 @@ pub fn generateIRQStub(comptime n: u8) []const u8 {
         \\ add $8, %esp
         \\ iret
         \\
-        , .{n, n, push_regs, pop_regs}
+        , .{
+            n,
+            kernel_entry_clear_flags,
+            n,
+            push_regs,
+            pop_regs
+        }
     );
 }
 
@@ -224,6 +277,7 @@ fn generateStub(comptime n: u8, comptime has_error: bool) []const u8 {
     return std.fmt.comptimePrint(
         \\isr_stub_{d}:
         \\ cli
+        \\ {s}
         \\ {s}
         \\ push ${d}
         \\ {s}
@@ -237,7 +291,14 @@ fn generateStub(comptime n: u8, comptime has_error: bool) []const u8 {
         \\ add $8, %esp
         \\ iret
         \\
-        , .{n, if (has_error) "" else "push $0", n, push_regs, pop_regs}
+        , .{
+            n,
+            kernel_entry_clear_flags,
+            if (has_error) "" else "push $0",
+            n,
+            push_regs,
+            pop_regs,
+        }
     );
 }
 
@@ -357,7 +418,7 @@ pub fn idtInit() void {
             if (index < CPU_EXCEPTION_COUNT) 0x8E else 0xEE
         );
     }
-    
+
     asm volatile (
         \\lidt (%[idt_ptr])
         :
@@ -365,5 +426,4 @@ pub fn idtInit() void {
     );
     PICRemap();
     krn.exceptions.registerExceptionHandlers();
-    asm volatile ("sti"); // set the interrupt flag
 }

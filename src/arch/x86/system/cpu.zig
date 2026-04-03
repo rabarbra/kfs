@@ -1,3 +1,4 @@
+
 const krn = @import("kernel");
 const KERNEL_CODE_SEGMENT = @import("../idt.zig").KERNEL_CODE_SEGMENT;
 const KERNEL_DATA_SEGMENT = @import("../idt.zig").KERNEL_DATA_SEGMENT;
@@ -64,19 +65,19 @@ pub const Regs = struct {
     }
 
     pub fn dump(self: *Regs) void {
-        krn.logger.INFO("EIP: {X:0>8}\n", .{ self.eip});
+        krn.logger.ERROR("EIP: {X:0>8}\n", .{ self.eip});
 
-        krn.logger.INFO("EAX: {X:0>8} EBX: {X:0>8} ECX: {X:0>8} EDX: {X:0>8}\n", .{ self.eax, self.ebx, self.ecx, self.edx });
-        krn.logger.INFO("ESI: {X:0>8} EDI: {X:0>8} EBP: {X:0>8} ESP: {X:0>8}\n", .{ self.esi, self.edi, self.ebp, self.esp });
-        krn.logger.INFO("EFLAGS: {X:0>8}\n", .{self.eflags});
-        krn.logger.INFO("USERESP: {X:0>8}\n", .{self.useresp});
-        krn.logger.INFO("gs {X:0>8}\n", .{self.gs});
-        krn.logger.INFO("fs {X:0>8}\n", .{self.fs});
-        krn.logger.INFO("es {X:0>8}\n", .{self.es});
-        krn.logger.INFO("ds {X:0>8}\n", .{self.ds});
-        krn.logger.INFO("cs {X:0>8}\n", .{self.cs});
-        krn.logger.INFO("ss {X:0>8}\n", .{self.ss});
-        krn.logger.INFO("int_no {X:0>8}\n", .{self.int_no});
+        krn.logger.ERROR("EAX: {X:0>8} EBX: {X:0>8} ECX: {X:0>8} EDX: {X:0>8}\n", .{ self.eax, self.ebx, self.ecx, self.edx });
+        krn.logger.ERROR("ESI: {X:0>8} EDI: {X:0>8} EBP: {X:0>8} ESP: {X:0>8}\n", .{ self.esi, self.edi, self.ebp, self.esp });
+        krn.logger.ERROR("EFLAGS: {X:0>8}\n", .{self.eflags});
+        krn.logger.ERROR("USERESP: {X:0>8}\n", .{self.useresp});
+        krn.logger.ERROR("gs {X:0>8}\n", .{self.gs});
+        krn.logger.ERROR("fs {X:0>8}\n", .{self.fs});
+        krn.logger.ERROR("es {X:0>8}\n", .{self.es});
+        krn.logger.ERROR("ds {X:0>8}\n", .{self.ds});
+        krn.logger.ERROR("cs {X:0>8}\n", .{self.cs});
+        krn.logger.ERROR("ss {X:0>8}\n", .{self.ss});
+        krn.logger.ERROR("int_no {X:0>8}\n", .{self.int_no});
     }
 
     pub fn isRing3(self: *Regs) bool {
@@ -143,11 +144,11 @@ pub inline fn archReschedule() void {
         \\ pushf
         \\ pop %%eax            # Pop into EAX
         \\ test $0x200, %%eax   # Test bit 9 (IF)
-        \\ jz return_point      # Jump if interrupts are disabled
+        \\ jz 1f      # Jump if interrupts are disabled
         \\ pushf
         \\ cli
         \\ push %[code_seg]     # CS (kernel code segment)
-        \\ push $return_point
+        \\ push $1f
         \\ push $0
         \\ push $16
         \\ pusha
@@ -173,7 +174,7 @@ pub inline fn archReschedule() void {
         \\ popa
         \\ add $8, %%esp
         \\ iret
-        \\ return_point:
+        \\ 1:
         \\ nop
         \\
         :

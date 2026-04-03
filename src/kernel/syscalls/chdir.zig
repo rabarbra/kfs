@@ -13,6 +13,7 @@ pub fn chdir(path: ?[*:0]const u8) !u32 {
     const p = fs.path.resolve(user_path) catch {
         return errors.ENOENT;
     };
+    errdefer p.release();
     if (!p.dentry.inode.mode.isDir()) {
         return errors.ENOTDIR;
     }
@@ -30,6 +31,8 @@ pub fn chdir(path: ?[*:0]const u8) !u32 {
 
 pub fn fchdir(fd: u32) !u32 {
     if (krn.task.current.files.fds.get(fd)) |file| {
+        file.ref.ref();
+        defer file.ref.unref();
         if (!file.inode.mode.isDir()) {
             return errors.ENOTDIR;
         }
@@ -39,10 +42,10 @@ pub fn fchdir(fd: u32) !u32 {
         )) {
             return errors.EACCES;
         }
-        if (file.path != null)
+        if (file.path == null)
             return krn.errors.PosixError.ENOENT;
         const old = krn.task.current.fs.pwd;
-        krn.task.current.fs.pwd = file.path.?;
+        krn.task.current.fs.pwd = file.path.?.clone();
         old.release();
         return 0;
     }

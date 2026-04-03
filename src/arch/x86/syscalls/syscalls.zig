@@ -4,6 +4,7 @@ const tsk = krn.task;
 const registerHandler = krn.irq.registerHandler;
 const systable = @import("table.zig");
 const errors = krn.errors;
+pub const thread = @import("thread.zig");
 
 pub fn syscallsManager(state: *arch.Regs) void {
     tsk.current.regs = state.*;
@@ -34,11 +35,16 @@ pub fn syscallsManager(state: *arch.Regs) void {
             state.edi,
             state.ebp,
         ) catch |err| {
-            krn.logger.ERROR("[PID {d:<2}]: {t}: {t}\n", .{
-                tsk.current.pid,
-                sys,
-                err
-            });
+            switch (err) {
+                krn.errors.PosixError.EINTR,
+                krn.errors.PosixError.ECHILD, => {},
+                else => krn.logger.ERROR("[PID {d:<2}]: {t}: {t}\n", .{
+                    tsk.current.pid,
+                    sys,
+                    err
+                }),
+            }
+
             state.eax = errors.toErrno(err);
             return ;
         };
@@ -49,6 +55,7 @@ pub fn syscallsManager(state: *arch.Regs) void {
 pub fn initSyscalls() void {
     registerHandler(
         arch.SYSCALL_INTERRUPT - arch.CPU_EXCEPTION_COUNT,
-        &syscallsManager
+        &syscallsManager,
+        null
     );
 }

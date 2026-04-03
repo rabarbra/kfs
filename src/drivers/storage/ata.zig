@@ -199,8 +199,6 @@ pub const ATADrive = struct {
     status:     ATA_Status      = .ATA_STATUS_IDLE,
     device_cmd: u8 = 0,
 
-    buffer: []u8 = undefined,
-
     lba28: u32 = 0,
     lba48: u64 = 0,
     drive: u8 = 0,
@@ -219,7 +217,7 @@ pub const ATADrive = struct {
     pub const SECTOR_SIZE = 512;
     pub const DMA_BUFFER_PAGES = 8;
     const TIMEOUT_READY = 10000;
-    const TIMEOUT_DMA = 1000000;
+    const TIMEOUT_DMA = 10000000;
     const STATUS_READ_COUNT = 15;
 
     fn init(
@@ -235,12 +233,6 @@ pub const ATADrive = struct {
             .irq_num = ch_type.getIRQ(),
             .device_cmd = ch_type.getDevCmd(),
         };
-        if (kernel.mm.kmallocArray(u8, SECTOR_SIZE)) |array| {
-            drv.buffer = array[0..SECTOR_SIZE];
-        } else {
-            return null;
-        }
-        errdefer kernel.mm.kfree(drv.buffer.ptr);
         @memcpy(drv.name[0..41], name[0..41]);
         drv.lba28 = @as(*u32, @ptrCast(@alignCast(&ide_buf[60]))).*;
         drv.lba48 = @as(*u64, @ptrCast(@alignCast(&ide_buf[100]))).*;
@@ -254,6 +246,7 @@ pub const ATADrive = struct {
     }
 
     fn initDMA(self: *ATADrive) void {
+        const lock_state = kernel.mm.mem_lock.lock_irq_disable();
         const phys = kernel.mm.virt_memory_manager.pmm.allocPages(DMA_BUFFER_PAGES + 1);
         const buff_phys: u32 = @intCast(phys + kernel.mm.PAGE_SIZE);
 
@@ -282,6 +275,7 @@ pub const ATADrive = struct {
             );
             @memset(@as([*]u8, @ptrFromInt(vrt))[0..4096], 0);
         }
+        kernel.mm.mem_lock.unlock_irq_enable(lock_state);
 
         self.prdt_phys = phys;
         self.prdt_virt = virt;
@@ -319,26 +313,6 @@ pub const ATADrive = struct {
                 return;
             }
         }
-    }
-
-    fn read_sectors(self: *const ATADrive, lba: u32, num_sectors: u8) []const u8 {
-        self.selectDeviceLBA(lba);
-        const device_cmd: u8 = self.device_cmd | @as(u8, @truncate((lba >> 24) & 0x0F));
-        self.ataWriteReg(ATA_REG_SECCOUNT0, num_sectors);
-        self.ataWriteReg(ATA_REG_LBA0, @truncate(lba));
-        self.ataWriteReg(ATA_REG_LBA1, @truncate(lba >> 8));
-        self.ataWriteReg(ATA_REG_LBA2, @truncate(lba >> 16));
-        self.ataWriteReg(ATA_REG_HDDEVSEL, device_cmd);
-        self.ataWriteReg(ATA_REG_COMMAND, ATA_CMD_READ_PIO);
-        self.poll_ide();
-        const sectors: u32 = if (num_sectors == 0) 256 else num_sectors;
-        for (0..256 * sectors) |i| {
-            const word = arch.io.inw(self.io_base + ATA_REG_DATA);
-            self.buffer[i*2]     = @truncate(word);
-            self.buffer[i*2 + 1] = @truncate(word >> 8);
-        }
-        self.delay();
-        return self.buffer[0..512 * sectors];
     }
 
     fn waitNotBusy(self: *const ATADrive) bool {
@@ -487,18 +461,6 @@ pub const ATADrive = struct {
         return arch.io.inb(channel.io_base + reg);
     }
 
-    pub fn read_full_drive(self: *const ATADrive) void {
-        // self.selectChannel();
-        const num_sec: u32 = 1;
-        for (0..self.lba28 / num_sec) |i| {
-            const lba = i * num_sec;
-            const sector = self.read_sectors(lba, num_sec);
-            if (!std.mem.allEqual(u8, sector, 0)) {
-                kernel.logger.INFO("{d}: {s}", .{ lba, sector });
-            }
-        }
-    }
-
     pub fn read_full_drive_dma(self: *const ATADrive) void {
         // self.selectChannel();
         const num_sec: u32 = 1;
@@ -576,7 +538,8 @@ fn ata_identify(ch_type: ChannelType) u8 {
     }
     irq.registerHandler(
         ch_type.getIRQ(),
-        if (ch_type.isPrimary()) ata_primary else ata_secondary
+        if (ch_type.isPrimary()) ata_primary else ata_secondary,
+        null
     );
     return 1;
 }

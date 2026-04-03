@@ -68,8 +68,10 @@ pub const Path = struct {
                 }
                 if (self.mnt.root.tree.parent) |d| {
                     if (self.mnt.tree.parent) |p| {
+                        const mnt = p.entry(fs.Mount, "tree");
+                        mnt.count.ref();
                         self.mnt.count.unref();
-                        self.mnt = p.entry(fs.Mount, "tree");
+                        self.mnt = mnt;
                         self.setDentry(d.entry(fs.DEntry, "tree"));
                     } else {
                         return krn.errors.PosixError.EINVAL;
@@ -91,7 +93,8 @@ pub const Path = struct {
             ) catch |err| {
                 return err;
             };
-            self.setDentry(dentry);
+            self.dentry.ref.unref();
+            self.dentry = dentry;
         }
         self.resolveMount();
         if (self.dentry.inode.mode.isLink() and follow) {
@@ -106,6 +109,7 @@ pub const Path = struct {
             return buf[0..0];
         }
         var curr = try resolveFrom("..", self, true);
+        defer curr.release();
         const res = try curr.getAbsPath(buf);
         buf[res.len] = '/';
         var _d: *fs.DEntry = undefined;
@@ -159,6 +163,7 @@ pub fn dir_resolve(path: []const u8, last: *[]const u8) !Path {
         cwd.mnt,
         cwd.dentry
     );
+    errdefer curr.release();
     try curr.stepInto(".", true);
     var it = std.mem.tokenizeScalar(
         u8,
@@ -188,6 +193,7 @@ pub fn dir_resolve_from(path: []const u8, from: Path, last: *[]const u8) !Path {
         cwd.mnt,
         cwd.dentry
     );
+    errdefer curr.release();
     try curr.stepInto(".", true);
     var it = std.mem.tokenizeScalar(
         u8,
@@ -213,6 +219,7 @@ pub fn isRelative(path: []const u8) bool {
 pub fn resolveFrom(path: []const u8, from: Path, follow: bool) !Path {
     var last: [] const u8 = "";
     var res = try dir_resolve_from(path, from, &last);
+    errdefer res.release();
     if (last.len > 0) {
         try res.stepInto(last, follow);
     }
@@ -222,6 +229,7 @@ pub fn resolveFrom(path: []const u8, from: Path, follow: bool) !Path {
 pub fn resolve(path: []const u8) !Path {
     var last: [] const u8 = "";
     var res = try dir_resolve(path, &last);
+    errdefer res.release();
     if (last.len > 0) {
         try res.stepInto(last, true);
     }

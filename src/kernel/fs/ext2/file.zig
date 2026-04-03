@@ -52,7 +52,7 @@ pub const Ext2File = struct {
         }
 
         const buff = try ext2_sb.readBlocks(pbn, 1);
-        defer krn.mm.kfree(buff.ptr);
+        defer krn.mm.vfree(buff.ptr);
 
         const off: usize = base.pos % bs;
         if (off + to_write > bs) {
@@ -128,7 +128,7 @@ pub const Ext2File = struct {
 
         // read the actual data block
         const file_buf = try ext2_sb.readBlocks(first_pbn, contig_pbn_count);
-        defer krn.mm.kfree(file_buf.ptr);
+        defer krn.mm.vfree(file_buf.ptr);
 
         var bytes_read: usize = file_buf.len - read_offset;
         if (bytes_read > to_read) {
@@ -170,7 +170,7 @@ pub const Ext2File = struct {
 
         const block: usize = ext2_dir_inode.data.i_block[blk_index];
         const block_slice: []u8 = try ext2_super.readBlocks(block, 1);
-        defer krn.mm.kfree(block_slice.ptr);
+        defer krn.mm.vfree(block_slice.ptr);
         var bytes_written: usize = 0;
 
         while (bytes_written < buf.len and offset < block_size) {
@@ -217,6 +217,18 @@ pub const Ext2File = struct {
         return bytes_written;
     }
 
+    fn lseek(base: *fs.File, offset: i32, whence: usize) anyerror!usize {
+        var new_pos: i64 = @intCast(offset);
+        switch (whence) {
+            krn.fs.SEEK_CUR => new_pos = @as(i64, @intCast(base.pos)) + offset,
+            krn.fs.SEEK_END => new_pos = @as(i64, @intCast(base.inode.size)) + offset,
+            else => {}
+        }
+        if (new_pos < 0)
+            return krn.errors.PosixError.EINVAL;
+        base.pos = @intCast(new_pos);
+        return base.pos;
+    }
 };
 
 pub const Ext2FileOps: fs.FileOps = fs.FileOps {
@@ -224,6 +236,6 @@ pub const Ext2FileOps: fs.FileOps = fs.FileOps {
     .close = Ext2File.close,
     .write = Ext2File.write,
     .read = Ext2File.read,
-    .lseek = null,
+    .lseek = Ext2File.lseek,
     .readdir = Ext2File.readdir,
 };

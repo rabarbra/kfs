@@ -14,6 +14,8 @@ const ELFDATA2LSB = 1;
 
 const EV_CURRENT = 1;
 
+const PIE_LOAD_BASE: usize = 0x0001_0000; // base addr where to load PIE static binaries
+
 const PT_TYPE = enum (u32) {
     PT_NULL = 0,
     PT_LOAD = 1,
@@ -39,16 +41,13 @@ const AuxEntry = struct {
     val: usize,
 };
 
-const auxv: [2]AuxEntry = .{
-    AuxEntry{
-        .key = 6,
-        .val = krn.mm.PAGE_SIZE,
-    },
-    AuxEntry{
-        .key = 0,
-        .val = 0,
-    }
-};
+const AT_NULL = 0;
+const AT_PHDR = 3;  // address of program headers in memory
+const AT_PHENT = 4; // size of one program header
+const AT_PHNUM = 5; // number of program headers
+const AT_PAGESZ = 6;
+const AT_BASE = 7;  // load base for PIE
+const AT_ENTRY = 9; // entry point address
 
 pub const ElfValidationError = error {
     InvalidMagic,
@@ -56,9 +55,10 @@ pub const ElfValidationError = error {
     UnsupportedEndianness,
     UnsupportedVersion,
     UnsupportedMachine,
+    UnsupportedType,
     InvalidHeaderSize,
     FileTooSmall,
-    Dynamic,
+    DynamicLoaderRequired,
 };
 
 pub fn validateElfHeader(userspace: []const u8) !void{
@@ -94,14 +94,16 @@ pub fn validateElfHeader(userspace: []const u8) !void{
         return ElfValidationError.InvalidHeaderSize;
     }
 
-    const is_statically_linked = checkStaticLinking32(userspace, ehdr);
-    if (!is_statically_linked)
-        return ElfValidationError.Dynamic;
+    if (ehdr.e_type != .EXEC and ehdr.e_type != .DYN) {
+        return ElfValidationError.UnsupportedType;
+    }
+
+    if (!checkKernelLoadable32(userspace, ehdr))
+        return ElfValidationError.DynamicLoaderRequired;
 }
 
-fn checkStaticLinking32(userspace: []const u8, ehdr: *const std.elf.Elf32_Ehdr) bool {
+fn checkKernelLoadable32(userspace: []const u8, ehdr: *const std.elf.Elf32_Ehdr) bool {
     var has_interp = false;
-    var has_dynamic = false;
 
     for (0..ehdr.e_phnum) |i| {
         if (ehdr.e_phoff + (ehdr.e_phentsize * i) + @sizeOf(std.elf.Elf32_Phdr) > userspace.len) {
@@ -115,14 +117,19 @@ fn checkStaticLinking32(userspace: []const u8, ehdr: *const std.elf.Elf32_Ehdr) 
         const header_type: PT_TYPE = @enumFromInt(p_hdr.p_type);
         switch (header_type) {
             .PT_INTERP => has_interp = true,
-            .PT_DYNAMIC => has_dynamic = true,
             else => {},
         }
     }
-    return !has_interp and !has_dynamic;
+    return !has_interp;
 }
 
-pub fn setEnvironment(stack_bottom: usize, stack_size: usize, argv: []const []const u8, envp: []const []const u8) void {
+pub fn setEnvironment(
+    stack_bottom: usize,
+    stack_size: usize,
+    argv: []const []const u8,
+    envp: []const []const u8,
+    aux_entries: []const AuxEntry,
+) void {
     // Auxiliary vector
     var argv_str_size: usize = 0;
     for (argv) |arg| {
@@ -134,7 +141,7 @@ pub fn setEnvironment(stack_bottom: usize, stack_size: usize, argv: []const []co
     }
     const argv_ptr_size = @sizeOf(usize) * (argv.len + 1);
     const envp_ptr_size = @sizeOf(usize) * (envp.len + 1);
-    const auxv_size = @sizeOf(AuxEntry) * auxv.len;
+    const auxv_size = @sizeOf(AuxEntry) * aux_entries.len;
     const argc_size = @sizeOf(usize);
     const end_marker_size = @sizeOf(usize);
 
@@ -186,7 +193,7 @@ pub fn setEnvironment(stack_bottom: usize, stack_size: usize, argv: []const []co
     // Set auxv
     var aux_ptr: [*]AuxEntry = @ptrCast(&pointers[ptr_off]);
     ptr_off = 0;
-    for (auxv) |aux| {
+    for (aux_entries) |aux| {
         aux_ptr[ptr_off] = aux;
         ptr_off += 1;
     }
@@ -199,6 +206,8 @@ pub fn prepareBinary(userspace: []const u8, argv: []const []const u8, envp: []co
 
     const prot: u32 = krn.mm.PROT_RW;
     const ehdr: *const std.elf.Elf32_Ehdr = @ptrCast(@alignCast(userspace));
+    const is_pie = ehdr.e_type == .DYN;
+    const load_base: usize = if (is_pie) PIE_LOAD_BASE else 0;
 
     for (0..ehdr.e_phnum) |i| {
         const p_hdr: *std.elf.Elf32_Phdr = @ptrCast(
@@ -213,8 +222,10 @@ pub fn prepareBinary(userspace: []const u8, argv: []const []const u8, envp: []co
             num_pages += 1;
 
         // Create anonymous mapping for each section with proper page alignment
-        const page_start = arch.pageAlign(p_hdr.p_vaddr, true);  // Round down to page boundary
-        const page_end = arch.pageAlign(p_hdr.p_vaddr + p_hdr.p_memsz, false);  // Round up to page boundary
+        const seg_start = load_base + p_hdr.p_vaddr;
+        const seg_end = seg_start + p_hdr.p_memsz;
+        const page_start = arch.pageAlign(seg_start, true);  // Round down to page boundary
+        const page_end = arch.pageAlign(seg_end, false);  // Round up to page boundary
         const aligned_size = page_end - page_start;
 
         _ = krn.task.current.mm.?.mmap_area(
@@ -224,8 +235,11 @@ pub fn prepareBinary(userspace: []const u8, argv: []const []const u8, envp: []co
             krn.mm.MAP.anonymous(),
             null,
             0
-        ) catch {return ;};
-        const section_ptr: [*]u8 = @ptrFromInt(p_hdr.p_vaddr);
+        ) catch {
+            krn.task.current.mm.?.releaseMappings();
+            return krn.errors.PosixError.ENOMEM;
+        };
+        const section_ptr: [*]u8 = @ptrFromInt(seg_start);
         if (p_hdr.p_filesz > 0) {
             @memcpy(
                 section_ptr[0..p_hdr.p_filesz],
@@ -235,8 +249,8 @@ pub fn prepareBinary(userspace: []const u8, argv: []const []const u8, envp: []co
         if (p_hdr.p_memsz > p_hdr.p_filesz) {
             @memset(section_ptr[p_hdr.p_filesz..p_hdr.p_memsz], 0);
         }
-        if (p_hdr.p_vaddr + p_hdr.p_memsz > heap_start)
-            heap_start = p_hdr.p_vaddr + p_hdr.p_memsz;
+        if (seg_end > heap_start)
+            heap_start = seg_end;
     }
     const stack_size: usize = stack_pages * arch.PAGE_SIZE;
     var stack_bottom: usize = krn.mm.PAGE_OFFSET - stack_pages * arch.PAGE_SIZE;
@@ -248,15 +262,36 @@ pub fn prepareBinary(userspace: []const u8, argv: []const []const u8, envp: []co
         null,
         0
     ) catch {
-        @panic("Unable to go to userspace\n");
+        krn.task.current.mm.?.releaseMappings();
+        return krn.errors.PosixError.ENOMEM;
     };
     const stack_ptr: [*]u8 = @ptrFromInt(stack_bottom);
     @memset(stack_ptr[0..stack_size], 0);
 
-    setEnvironment(stack_bottom, stack_size, argv, envp);
+    var aux_buf: [8]AuxEntry = undefined;
+    var aux_count: usize = 0;
+    if (is_pie) {
+        aux_buf[aux_count] = .{ .key = AT_PHDR, .val = load_base + ehdr.e_phoff };
+        aux_count += 1;
+        aux_buf[aux_count] = .{ .key = AT_PHENT, .val = ehdr.e_phentsize };
+        aux_count += 1;
+        aux_buf[aux_count] = .{ .key = AT_PHNUM, .val = ehdr.e_phnum };
+        aux_count += 1;
+        aux_buf[aux_count] = .{ .key = AT_ENTRY, .val = load_base + ehdr.e_entry };
+        aux_count += 1;
+        aux_buf[aux_count] = .{ .key = AT_BASE, .val = load_base };
+        aux_count += 1;
+    }
+    aux_buf[aux_count] = .{ .key = AT_PAGESZ, .val = krn.mm.PAGE_SIZE };
+    aux_count += 1;
+    aux_buf[aux_count] = .{ .key = AT_NULL, .val = 0 };
+    aux_count += 1;
+
+    setEnvironment(stack_bottom, stack_size, argv, envp, aux_buf[0..aux_count]);
 
     krn.logger.INFO("Userspace stack: 0x{X:0>8} 0x{X:0>8}", .{stack_bottom, stack_bottom + stack_size});
-    krn.logger.INFO("Userspace EIP (_start): 0x{X:0>8}", .{ehdr.e_entry});
+    const entry = load_base + ehdr.e_entry;
+    krn.logger.INFO("Userspace EIP (_start): 0x{X:0>8}", .{entry});
 
     // Also arch specific
     heap_start = arch.pageAlign(heap_start, false);
@@ -266,7 +301,7 @@ pub fn prepareBinary(userspace: []const u8, argv: []const []const u8, envp: []co
     krn.task.current.mm.?.heap = heap_start + HEAP_MMAP_GAP;
     krn.task.current.mm.?.stack_bottom = stack_bottom;
     krn.task.current.mm.?.stack_top = stack_bottom + stack_size;
-    krn.task.current.mm.?.code = ehdr.e_entry;
+    krn.task.current.mm.?.code = entry;
     krn.task.current.tsktype = .PROCESS;
 }
 

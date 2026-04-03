@@ -6,7 +6,8 @@ const kbd = @import("../kbd.zig");
 const fb = @import("../framebuffer.zig");
 
 const t = @import("./termios.zig");
-const tty_drv = @import("tty.zig");
+
+const KD_TEXT: u32 = 0x00;
 
 pub const DirtyRect = struct {
     x1: usize,
@@ -84,7 +85,19 @@ pub const WinSize = extern struct {
     ws_ypixel: u16 = 0    
 };
 
-const AnsiColor = enum(u4) {
+pub const Backend = enum {
+    screen,
+    serial,
+};
+
+pub const BackendOps = struct {
+    writeByte: ?*const fn (self: *TTY, b: u8) void = null,
+};
+
+const DEFAULT_FG: ANSI_256Color = ANSI_256Color.fromIdx(7);
+const DEFAULT_BG: ANSI_256Color = ANSI_256Color.fromIdx(0);
+
+const ANSI_16Palette = enum {
     BLACK,
     RED,
     GREEN,
@@ -102,13 +115,13 @@ const AnsiColor = enum(u4) {
     BR_CYAN,
     BR_WHITE,
 
-    pub fn toU32(self: AnsiColor) u32 {
+    pub fn toU32(self: ANSI_16Palette) u32 {
         return switch (self) {
             .BLACK =>       0x00000000,
             .RED =>         0x00990000,
             .GREEN =>       0x0000A600,
             .YELLOW =>      0x00999900,
-            .BLUE =>        0x000000b2,
+            .BLUE =>        0x006060f2,
             .MAGENTA =>     0x00b200b2,
             .CYAN =>        0x0000a6b2,
             .WHITE =>       0x00bfbfbf,
@@ -122,61 +135,110 @@ const AnsiColor = enum(u4) {
             .BR_WHITE =>    0x00e6e6e6,
         };
     }
+};
 
-    pub fn fromAnsiCode(code: u32) AnsiColor {
-        switch (code) {
-            30, 40 =>   return .BLACK,
-            31, 41 =>   return .RED,
-            32, 42 =>   return .GREEN,
-            33, 43 =>   return .YELLOW,
-            34, 44 =>   return .BLUE,
-            35, 45 =>   return .MAGENTA,
-            36, 46 =>   return .CYAN,
-            37, 47 =>   return .WHITE,
-            90, 100 =>  return .BR_BLACK,
-            91, 101 =>  return .BR_RED,
-            92, 102 =>  return .BR_GREEN,
-            93, 103 =>  return .BR_YELLOW,
-            94, 104 =>  return .BR_BLUE,
-            95, 105 =>  return .BR_MAGENTA,
-            96, 106 =>  return .BR_CYAN,
-            97, 107 =>  return .BR_WHITE,
-            else => return .BLACK,
-        }
+const ARGB = packed struct (u32) {
+    b: u8,
+    g: u8,
+    r: u8,
+    a: u8,
+
+    pub fn toU32(self: ARGB) u32 {
+        return (@as(u32, self.a) << 24)
+            | (@as(u32, self.r) << 16)
+            | (@as(u32, self.g) << 8)
+            | (@as(u32, self.b) << 0);
+    }
+
+    pub fn fromU32(color: u32) ARGB {
+        return ARGB{
+            .a = @truncate(color >> 24),
+            .r = @truncate(color >> 16),
+            .g = @truncate(color >> 8),
+            .b = @truncate(color >> 0),
+        };
     }
 };
 
-const DEFAULT_FG: u32 = 0x00BFBFBF;
-const DEFAULT_BG: u32 = 0x00000000;
+const ANSI_256Color = packed struct (u8) {
+    data: u8 = 0,
 
-fn color256ToRgb(idx: u16) u32 {
-    if (idx < 16) {
-        // Standard 16 colors
-        return AnsiColor.fromAnsiCode(idx + 30).toU32();
-    } else if (idx < 232) {
-        // 216-color cube (16-231): 6x6x6 RGB
-        const cube_idx = idx - 16;
-        const r: u32 = @intCast(cube_idx / 36);
-        const g: u32 = @intCast((cube_idx % 36) / 6);
-        const b: u32 = @intCast(cube_idx % 6);
-        const r_val: u32 = if (r == 0) 0 else 55 + r * 40;
-        const g_val: u32 = if (g == 0) 0 else 55 + g * 40;
-        const b_val: u32 = if (b == 0) 0 else 55 + b * 40;
-        return (r_val << 16) | (g_val << 8) | b_val;
-    } else {
-        // Grayscale (232-255): 24 shades from 8 to 238
-        const gray: u32 = @intCast((idx - 232) * 10 + 8);
-        return (gray << 16) | (gray << 8) | gray;
+    pub fn toU32(self: ANSI_256Color) u32 {
+        switch (self.data) {
+            0...15 => return @as(ANSI_16Palette, @enumFromInt(self.data)).toU32(),
+            16...231 => return self.cubeToARGB().toU32(),
+            232...255 => return self.greyToARGB().toU32(),
+        }
     }
-}
 
-/// Convert 24-bit RGB components to u32
-fn rgbToU32(r: u16, g: u16, b: u16) u32 {
-    const r_val: u32 = @intCast(@min(r, 255));
-    const g_val: u32 = @intCast(@min(g, 255));
-    const b_val: u32 = @intCast(@min(b, 255));
-    return (r_val << 16) | (g_val << 8) | b_val;
-}
+    pub fn fromIdx(idx: u8) ANSI_256Color {
+        return ANSI_256Color{ .data = idx };
+    }
+
+    pub fn fromANSICode(ansi_code: u8) ANSI_256Color {
+        switch (ansi_code) {
+            30...37 => return ANSI_256Color{ .data = ansi_code - 30 },
+            90...97 => return ANSI_256Color{ .data = ansi_code - 90 + 8 },
+            40...47 => return ANSI_256Color{ .data = ansi_code - 40 },
+            100...107 => return ANSI_256Color{ .data = ansi_code - 100 + 8 },
+            else => {},
+        }
+        return ANSI_256Color{ .data = 0 };
+    }
+
+    pub fn fromU32(color: u32) ANSI_256Color {
+        return fromARGB(ARGB.fromU32(color));
+    }
+
+    pub fn fromARGB(argb: ARGB) ANSI_256Color {
+        var best_idx: u8 = 0;
+        var best_dist: u32 = std.math.maxInt(u32);
+
+        var idx: u16 = 0;
+        while (idx < 256) : (idx += 1) {
+            const candidate = ANSI_256Color.fromIdx(@intCast(idx));
+            const candidate_argb = ARGB.fromU32(candidate.toU32());
+
+            const dr: i32 = @as(i32, argb.r) - @as(i32, candidate_argb.r);
+            const dg: i32 = @as(i32, argb.g) - @as(i32, candidate_argb.g);
+            const db: i32 = @as(i32, argb.b) - @as(i32, candidate_argb.b);
+            const dist: u32 = @intCast(dr * dr + dg * dg + db * db);
+
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_idx = @intCast(idx);
+                if (dist == 0)
+                    break;
+            }
+        }
+
+        return ANSI_256Color.fromIdx(best_idx);
+    }
+
+    fn cubeToARGB(self: ANSI_256Color) ARGB {
+        const lvl: [6]u8 = .{ 0, 95, 135, 175, 215, 255 };
+        const x: u8 = self.data - 16;
+        const r: u8 = x / 36;
+        const g: u8 = (x / 6) % 6;
+        const b: u8 = x % 6;
+        return ARGB{
+            .a = 0,
+            .r = lvl[r],
+            .g = lvl[g],
+            .b = lvl[b],
+        };
+    }
+
+    fn greyToARGB(self: ANSI_256Color) ARGB {
+        const gray: u8 = 8 + 10 * (self.data - 232);
+        return ARGB{
+            .a = 0,
+            .r = gray,
+            .g = gray,
+            .b = gray,
+        };
+    }
+};
 
 const Cursor = struct {
     kind: CursorType = .Block,
@@ -217,8 +279,8 @@ const Cursor = struct {
 
 const Cell = struct {
     ch: u8 = 0,
-    bg: u32,
-    fg: u32,
+    bg: ANSI_256Color,
+    fg: ANSI_256Color,
 
     pub fn eql(self: *const Cell, other: *const Cell) bool {
         return (
@@ -238,7 +300,7 @@ const Cell = struct {
         self.fg = DEFAULT_FG;
     }
 
-    pub fn clear(self: *Cell, bg: u32, fg: u32) void {
+    pub fn clear(self: *Cell, bg: ANSI_256Color, fg: ANSI_256Color) void {
         self.ch = 0;
         self.bg = bg;
         self.fg = fg;
@@ -257,8 +319,8 @@ const Page = struct {
     buff: [*]Cell,
     prev: [*]Cell,
 
-    curr_fg: u32 = DEFAULT_FG,
-    curr_bg: u32 = DEFAULT_BG,
+    curr_fg: ANSI_256Color = DEFAULT_FG,
+    curr_bg: ANSI_256Color = DEFAULT_BG,
     inverse: bool = false,
 
     dirty: DirtyRect = DirtyRect.init(0, 0, 0, 0),
@@ -304,6 +366,13 @@ const Page = struct {
         return self.getCell(self.cursor.x, self.cursor.y);
     }
 
+    pub fn isVisible(self: *Page) bool {
+        if (scr.current_tty) |_tty| {
+            return _tty.curr_page == self;
+        }
+        return false;
+    }
+
     pub fn setCursor(self: *Page, x: usize, y: usize) void {
         if (self.cursor.drawn) {
             self.markCellDirty(self.cursor.x, self.cursor.y);
@@ -335,8 +404,8 @@ const Page = struct {
             cell.ch,
             self.cursor.prev_x,
             self.cursor.prev_y,
-            cell.bg,
-            cell.fg,
+            cell.bg.toU32(),
+            cell.fg.toU32(),
         );
     }
 
@@ -349,12 +418,14 @@ const Page = struct {
         ) {
             return;
         }
+        if (!self.isVisible())
+            return ;
         self.restorePrevCursorPos();
         if (self.cursor.kind == .Underline) {
             scr.framebuffer.cursor(
                 self.cursor.x,
                 self.cursor.y,
-                self.curr_fg,
+                self.curr_fg.toU32(),
             );
         } else if (self.cursor.kind == .Block) {
             const cell = self.getCell(self.cursor.x, self.cursor.y);
@@ -363,15 +434,15 @@ const Page = struct {
                 ch,
                 self.cursor.x,
                 self.cursor.y,
-                cell.fg,
-                cell.bg,
+                cell.fg.toU32(),
+                cell.bg.toU32(),
             );
         }
         self.cursor.drawn = true;
     }
 
     pub fn render(self: *Page) void {
-        if (self.has_dirty) {
+        if (self.has_dirty and self.isVisible()) {
             const x1 = self.dirty.x1;
             const y1 = self.dirty.y1;
             const x2 = @min(self.dirty.x2, self.width - 1);
@@ -385,15 +456,15 @@ const Page = struct {
                             if (cell.isEmpty()) {
                                 scr.framebuffer.clearChar(
                                     col, row,
-                                    cell.bg
+                                    cell.bg.toU32()
                                 );
                             } else {
                                 scr.framebuffer.putchar(
                                     cell.ch,
                                     col,
                                     row,
-                                    cell.bg,
-                                    cell.fg,
+                                    cell.bg.toU32(),
+                                    cell.fg.toU32(),
                                 );
                             }
                             self.prev[off] = cell;
@@ -452,15 +523,17 @@ const Page = struct {
         }
 
         // Scroll the pixel buffer
-        const pixel_lines = lines * scr.framebuffer.font.height;
-        scr.framebuffer.scrollPixels(
-            pixel_lines,
-            direction,
-            self.curr_bg
-        );
+        if (self.isVisible()) {
+            const pixel_lines = lines * scr.framebuffer.font.height;
+            scr.framebuffer.scrollPixels(
+                pixel_lines,
+                direction,
+                self.curr_bg.toU32()
+            );
 
-        if (self.cursor.drawn) {
-            self.cleanupScrolledCursor(lines, direction);
+            if (self.cursor.drawn) {
+                self.cleanupScrolledCursor(lines, direction);
+            }
         }
         self.cursor.drawn = false;
 
@@ -513,7 +586,7 @@ const Page = struct {
     fn redrawCell(self: *Page, x: usize, y: usize) void {
         const cell = self.getCell(x, y);
         scr.framebuffer.putchar(
-            cell.ch, x, y, cell.bg, cell.fg
+            cell.ch, x, y, cell.bg.toU32(), cell.fg.toU32()
         );
     }
 
@@ -526,7 +599,7 @@ const Page = struct {
     }
 
     pub fn reRenderAll(self: *Page) void {
-        scr.framebuffer.clear(self.curr_bg);
+        scr.framebuffer.clear(self.curr_bg.toU32());
         @memset(
             self.prev[0..self.height * self.width],
             Cell{ .bg = self.curr_bg, .fg = self.curr_fg, .ch = 0 }
@@ -537,7 +610,7 @@ const Page = struct {
         self.render();
     }
 
-    pub fn setColors(self: *Page, fg: u32, bg: u32) void {
+    pub fn setColors(self: *Page, fg: ANSI_256Color, bg: ANSI_256Color) void {
         self.curr_bg = bg;
         self.curr_fg = fg;
     }
@@ -613,7 +686,7 @@ pub const TTY = struct {
 
     // input queue
     file_buff: krn.ringbuf.RingBuf = undefined,
-    lock: krn.Mutex = krn.Mutex.init(),
+    lock: krn.Spinlock = krn.Spinlock.init(),
     nonblock: bool = false,
     read_queue: krn.wq.WaitQueueHead = undefined,
 
@@ -625,7 +698,10 @@ pub const TTY = struct {
     // vt/kd
     vt_index: u16 = 1,
     vt_active: bool = true,
-    kd_mode: u32 = tty_drv.KD_TEXT,
+    kd_mode: u32 = KD_TEXT,
+    backend: Backend = .screen,
+    backend_ops: BackendOps = .{},
+    backend_data: ?*anyopaque = null,
 
     // editing
     _input_len: usize = 0,
@@ -652,7 +728,7 @@ pub const TTY = struct {
             .curr_page = undefined,
 
             .file_buff = rb,
-            .lock = krn.Mutex.init(),
+            .lock = krn.Spinlock.init(),
             .read_queue = krn.wq.WaitQueueHead.init(),
             .tab_len = 8,
             .winsz = WinSize{
@@ -661,8 +737,21 @@ pub const TTY = struct {
             },
             .term = default_termios(),
             .vt_index = vt_idx,
+            .backend = .screen,
+            .backend_ops = .{},
+            .backend_data = null,
         };
         return _tty;
+    }
+
+    pub fn initSerial() !TTY {
+        var _tty = try TTY.init(100, 30, 0);
+        _tty.backend = .serial;
+        return _tty;
+    }
+
+    pub fn setBackendOps(self: *TTY, ops: BackendOps) void {
+        self.backend_ops = ops;
     }
 
     pub fn setup(self: *TTY) void {
@@ -721,7 +810,7 @@ pub const TTY = struct {
                 .{@intFromPtr(self), @tagName(sig), self.fg_pgid}
             );
             _ = krn.kill(
-                self.fg_pgid, 
+                -self.fg_pgid,
                 @intFromEnum(sig)
             ) catch 0;
         } else {
@@ -733,6 +822,8 @@ pub const TTY = struct {
     }
 
     pub fn render(self: *TTY) void {
+        if (self.backend == .serial)
+            return;
         if (scr.current_tty) |curr| {
             if (self != curr)
                 return ;
@@ -898,16 +989,16 @@ pub const TTY = struct {
     }
 
     fn pushInput(self: *TTY, b: u8) void {
-        self.lock.lock();
+        const lock_state = self.lock.lock_irq_disable();
         _ = self.file_buff.push(b);
-        self.lock.unlock();
+        self.lock.unlock_irq_enable(lock_state);
         self.read_queue.wakeUpOne();
     }
 
     fn pushSeq(self: *TTY, s: []const u8) void {
-        self.lock.lock();
+        const lock_state = self.lock.lock_irq_disable();
         _ = self.file_buff.pushSlice(s);
-        self.lock.unlock();
+        self.lock.unlock_irq_enable(lock_state);
         self.read_queue.wakeUpOne();
     }
 
@@ -931,11 +1022,17 @@ pub const TTY = struct {
 
     fn processEnter(self: *TTY) void {
         self._input_len = 0;
-        if (self.term.c_lflag.ECHONL or self.term.c_lflag.ECHO)
-            self.printChar('\n');
-        self.lock.lock();
+        if (self.term.c_lflag.ECHONL or self.term.c_lflag.ECHO) {
+            if (self.backend == .serial) {
+                self.consume('\r');
+                self.consume('\n');
+            } else {
+                self.printChar('\n');
+            }
+        }
+        const lock_state = self.lock.lock_irq_disable();
         _ = self.file_buff.push('\n');
-        self.lock.unlock();
+        self.lock.unlock_irq_enable(lock_state);
         self.read_queue.wakeUpOne();
     }
 
@@ -947,18 +1044,18 @@ pub const TTY = struct {
                     continue;
                 if (self.handleISIG(b)) {
                     if (!self.term.c_lflag.NOFLSH) {
-                        self.lock.lock();
+                        const lock_state = self.lock.lock_irq_disable();
                         _ = self.file_buff.reset();
-                        self.lock.unlock();
+                        self.lock.unlock_irq_enable(lock_state);
                     }
                     continue;
                 }
                 if (self.term.c_lflag.ICANON) {
                     if (b == self.term.c_cc[t.VEOF] and b != 0) {
                         self._input_len = 0;
-                        self.lock.lock();
+                        const lock_state = self.lock.lock_irq_disable();
                         _ = self.file_buff.push('\n');
-                        self.lock.unlock();
+                        self.lock.unlock_irq_enable(lock_state);
                         self.read_queue.wakeUpOne();
                         continue;
                     }
@@ -971,9 +1068,9 @@ pub const TTY = struct {
                                     self.removeAtCursor();
                                 }
                             }
-                            self.lock.lock();
+                            const lock_state = self.lock.lock_irq_disable();
                             _ = self.file_buff.unwrite(line_len);
-                            self.lock.unlock();
+                            self.lock.unlock_irq_enable(lock_state);
                             self._input_len = 0;
                         }
                         continue;
@@ -983,11 +1080,18 @@ pub const TTY = struct {
                         continue;
                     }
                     if (b == 8 or b == 127) { // backspace
-                        if (self.term.c_lflag.ECHO)
-                            self.removeAtCursor();
-                        self.lock.lock();
+                        if (self.term.c_lflag.ECHO) {
+                            if (self.backend == .serial) {
+                                self.consume(8);
+                                self.consume(' ');
+                                self.consume(8);
+                            } else {
+                                self.removeAtCursor();
+                            }
+                        }
+                        const lock_state = self.lock.lock_irq_disable();
                         _ = self.file_buff.unwrite(1);
-                        self.lock.unlock();
+                        self.lock.unlock_irq_enable(lock_state);
                         continue;
                     }
                     if (b == 12) { // Ctrl+L
@@ -1002,19 +1106,36 @@ pub const TTY = struct {
                         continue;
                     }
                     // printable
-                    if (self.term.c_lflag.ECHO)
-                        self.insertAtCursor(b);
+                    if (self.term.c_lflag.ECHO) {
+                        if (self.backend == .serial) {
+                            self.consume(b);
+                        } else {
+                            self.insertAtCursor(b);
+                        }
+                    }
                     self.pushInput(b);
                 } else {
                     // raw mode
                     if (self.term.c_lflag.ECHO) {
-                        if (b == '\n'
-                            and self.term.c_oflag.OPOST
-                            and self.term.c_oflag.ONLCR
-                        ) {
-                            self.print("\r\n");
+                        if (self.backend == .serial) {
+                            if (b == '\n'
+                                and self.term.c_oflag.OPOST
+                                and self.term.c_oflag.ONLCR
+                            ) {
+                                self.consume('\r');
+                                self.consume('\n');
+                            } else {
+                                self.consume(b);
+                            }
                         } else {
-                            self.printChar(b);
+                            if (b == '\n'
+                                and self.term.c_oflag.OPOST
+                                and self.term.c_oflag.ONLCR
+                            ) {
+                                self.print("\r\n");
+                            } else {
+                                self.printChar(b);
+                            }
                         }
                     }
                     self.pushInput(b);
@@ -1051,6 +1172,11 @@ pub const TTY = struct {
         }
     }
 
+    pub fn inputByte(self: *TTY, b: u8) void {
+        var ev = [_]kbd.KeyEvent{.{ .ctl = false, .val = b }};
+        self.input(ev[0..]);
+    }
+
     fn move(self: *TTY, dir: u8) void {
         const x = self.curr_page.cursor.x;
         if (dir == 0) {
@@ -1072,13 +1198,6 @@ pub const TTY = struct {
         self.render();
     }
 
-    pub fn setColor(self: *TTY, fg: AnsiColor) void {
-        self.curr_page.curr_fg = fg;
-    }
-
-    pub fn setBgColor(self: *TTY, bg: AnsiColor) void {
-        self.curr_page.curr_bg = bg;
-    }
 
     pub fn clear(self: *TTY) void {
         self.curr_page.clear();
@@ -1300,7 +1419,7 @@ pub const TTY = struct {
                         },
                         // Foreground colors
                         30...37 => {
-                            self.curr_page.curr_fg = AnsiColor.fromAnsiCode(p).toU32();
+                            self.curr_page.curr_fg = ANSI_256Color.fromANSICode(@intCast(p));
                         },
                         38 => {
                             // Extended foreground color: 38;5;N or 38;2;R;G;B
@@ -1308,15 +1427,20 @@ pub const TTY = struct {
                                 const mode = self.csi_params[i + 1];
                                 if (mode == 5 and i + 2 < self.csi_n) {
                                     // 256-color mode: 38;5;N
-                                    const color_idx = self.csi_params[i + 2];
-                                    self.curr_page.curr_fg = color256ToRgb(color_idx);
+                                    const color_idx: u8 = @intCast(@min(self.csi_params[i + 2], 255));
+                                    self.curr_page.curr_fg = ANSI_256Color.fromIdx(color_idx);
                                     i += 2;
                                 } else if (mode == 2 and i + 4 < self.csi_n) {
                                     // 24-bit color: 38;2;R;G;B
-                                    const r = self.csi_params[i + 2];
-                                    const g = self.csi_params[i + 3];
-                                    const b = self.csi_params[i + 4];
-                                    self.curr_page.curr_fg = rgbToU32(r, g, b);
+                                    const r: u8 = @intCast(@min(self.csi_params[i + 2], 255));
+                                    const g: u8 = @intCast(@min(self.csi_params[i + 3], 255));
+                                    const b: u8 = @intCast(@min(self.csi_params[i + 4], 255));
+                                    self.curr_page.curr_fg = ANSI_256Color.fromARGB(ARGB{
+                                        .a = 0,
+                                        .r = r,
+                                        .g = g,
+                                        .b = b,
+                                    });
                                     i += 4;
                                 }
                             }
@@ -1326,8 +1450,7 @@ pub const TTY = struct {
                         },
                         // Background colors
                         40...47 => {
-                            const color = AnsiColor.fromAnsiCode(p).toU32();
-                            self.curr_page.curr_bg = color;
+                            self.curr_page.curr_bg = ANSI_256Color.fromANSICode(@intCast(p));
                         },
                         48 => {
                             // Extended background color: 48;5;N or 48;2;R;G;B
@@ -1335,15 +1458,20 @@ pub const TTY = struct {
                                 const mode = self.csi_params[i + 1];
                                 if (mode == 5 and i + 2 < self.csi_n) {
                                     // 256-color mode: 48;5;N
-                                    const color_idx = self.csi_params[i + 2];
-                                    self.curr_page.curr_bg = color256ToRgb(color_idx);
+                                    const color_idx: u8 = @intCast(@min(self.csi_params[i + 2], 255));
+                                    self.curr_page.curr_bg = ANSI_256Color.fromIdx(color_idx);
                                     i += 2;
                                 } else if (mode == 2 and i + 4 < self.csi_n) {
                                     // 24-bit color: 48;2;R;G;B
-                                    const r = self.csi_params[i + 2];
-                                    const g = self.csi_params[i + 3];
-                                    const b = self.csi_params[i + 4];
-                                    self.curr_page.curr_bg = rgbToU32(r, g, b);
+                                    const r: u8 = @intCast(@min(self.csi_params[i + 2], 255));
+                                    const g: u8 = @intCast(@min(self.csi_params[i + 3], 255));
+                                    const b: u8 = @intCast(@min(self.csi_params[i + 4], 255));
+                                    self.curr_page.curr_bg = ANSI_256Color.fromARGB(ARGB{
+                                        .a = 0,
+                                        .r = r,
+                                        .g = g,
+                                        .b = b,
+                                    });
                                     i += 4;
                                 }
                             }
@@ -1353,11 +1481,11 @@ pub const TTY = struct {
                         },
                         // Bright foreground colors
                         90...97 => {
-                            self.curr_page.curr_fg = AnsiColor.fromAnsiCode(p).toU32();
+                            self.curr_page.curr_fg = ANSI_256Color.fromANSICode(@intCast(p));
                         },
                         // Bright background colors
                         100...107 => {
-                            self.curr_page.curr_bg = AnsiColor.fromAnsiCode(p).toU32();
+                            self.curr_page.curr_bg = ANSI_256Color.fromANSICode(@intCast(p));
                         },
                         else => {},
                     }
@@ -1668,6 +1796,12 @@ pub const TTY = struct {
 
     // consume one byte of OUTPUT
     pub fn consume(self: *TTY, b: u8) void {
+        if (self.backend == .serial) {
+            if (self.backend_ops.writeByte) |write_byte| {
+                write_byte(self, b);
+            }
+            return;
+        }
         switch (self.pstate) {
             .Normal => switch (b) {
                 0x1b => self.pstate = .Esc,

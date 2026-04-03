@@ -4,8 +4,6 @@ const builtin = @import("builtin");
 const name = "kfs.bin";
 const kernel_src = "src/main.zig";
 
-const userspace_name = "userspace.bin";
-
 const archs = [_]std.Target.Cpu.Arch{
     std.Target.Cpu.Arch.x86,
     std.Target.Cpu.Arch.x86_64,
@@ -80,11 +78,10 @@ pub fn build(b: *std.Build) !void {
         .abi = .none
     };
     const Features = std.Target.x86.Feature;
-    target.cpu_features_sub.addFeature(@intFromEnum(Features.mmx));
-    target.cpu_features_sub.addFeature(@intFromEnum(Features.sse));
-    target.cpu_features_sub.addFeature(@intFromEnum(Features.sse2));
     target.cpu_features_sub.addFeature(@intFromEnum(Features.avx));
     target.cpu_features_sub.addFeature(@intFromEnum(Features.avx2));
+    target.cpu_features_sub.addFeature(@intFromEnum(Features.sse));
+    target.cpu_features_sub.addFeature(@intFromEnum(Features.sse2));
     target.cpu_features_add.addFeature(@intFromEnum(Features.soft_float));
     const kernel = b.addExecutable(.{
         .name = name,
@@ -146,25 +143,4 @@ pub fn build(b: *std.Build) !void {
     const kernel_step = b.step(name, "Build the kernel");
     kernel.step.dependOn(codegen_step);
     kernel_step.dependOn(&kernel.step);
-
-    // Add userspace binary
-    const userspace = b.addExecutable(.{
-        .name = userspace_name,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("./userspace/src/main.zig"),
-            .target = b.resolveTargetQuery(target),
-            .optimize = .ReleaseSmall,
-            .code_model = .default,
-            .strip = false,
-            .error_tracing = false,
-            .link_libc = false,
-            .single_threaded = true,
-        }),
-        .linkage = .static,
-    });
-    userspace.setLinkerScript(b.path("./userspace/linker.ld"));
-
-    const userspace_step = b.step(userspace_name, "Compile userspace init binary");
-    userspace_step.dependOn(&userspace.step);
-    userspace_step.dependOn(&b.addInstallArtifact(userspace, .{}).step);
 }

@@ -50,6 +50,7 @@ pub const File = struct {
         self.ref.dropFn = File.release;
         self.ref.ref();
         self.inode = inode;
+        self.inode.ref.ref();
         self.data = null;
     }
 
@@ -57,9 +58,9 @@ pub const File = struct {
         const file: *File = kernel.list.containerOf(File, @intFromPtr(ref), "ref");
         const inode: *fs.Inode = file.inode;
         file.ops.close(file); //?
+        inode.ref.unref();
         if (file.path != null)
             file.path.?.release();
-        inode.ref.unref();
         kernel.mm.kfree(file);
     }
 
@@ -106,7 +107,7 @@ pub const FileOps = struct {
     read: *const fn (base: *File, buf: [*]u8, size: usize) anyerror!usize,
     lseek: ?*const fn (base: *File, offset: i32, origin: usize) anyerror!usize = null,
     readdir: ?*const fn (base: *File, buf: []u8) anyerror!usize = readdirVFS,
-    ioctl: ?*const fn (base: *File, op: u32, data: ?*anyopaque) anyerror!u32 = null,
+    ioctl: ?*const fn (base: *File, op: u32, data: usize) anyerror!u32 = null,
     poll: ?*const fn (base: *File, pollfd: *kernel.poll.PollFd) anyerror!u32 = pollVFS,
 };
 
@@ -129,6 +130,22 @@ pub const TaskFiles = struct {
             return files;
         }
         return null;
+    }
+
+    pub fn deinit(self: *TaskFiles) void {
+        var it = self.map.iterator(.{
+            .direction = .forward,
+            .kind = .set
+        });
+        while (it.next()) |idx| {
+            if (self.fds.fetchRemove(idx)) |kv| {
+                kv.value.ref.unref();
+            }
+        }
+        self.fds.deinit();
+        self.map.deinit();
+        self.closexec.deinit();
+        kernel.mm.kfree(self);
     }
 
     pub fn dup(self: *TaskFiles, old: *TaskFiles) !void {

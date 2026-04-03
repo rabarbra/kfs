@@ -14,31 +14,23 @@ pub fn createFile(
     fops: *const fs.FileOps,
     mode: fs.UMode
 ) !*fs.DEntry {
-    _ = parent.inode.ops.lookup(parent, name) catch {
+    const dent = parent.inode.ops.lookup(parent, name) catch {
         const new_file = try parent.inode.ops.create(parent.inode, name, mode, parent);
         new_file.inode.fops = fops;
         return new_file;
     };
+    dent.release();
     return kernel.errors.PosixError.EEXIST;
 }
 
 pub fn deleteRecursive(dentry: *fs.DEntry) !void {
-    if (dentry.tree.hasChildren()) {
-        var it = dentry.tree.child.?.siblingsIterator();
-        while (it.next()) |node| {
-            const child = node.curr.entry(fs.DEntry, "tree");
-            if (child.inode.mode.isDir()) {
-                try deleteRecursive(child);
-                if (child.inode.ops.rmdir) |_rmdir| {
-                    it.reset(node.curr);
-                    try _rmdir(child, dentry);
-                }
-            } else {
-                if (child.inode.ops.unlink) |_unlink| {
-                    it.reset(node.curr);
-                    try _unlink(dentry.inode, child);
-                }
-            }
+    while (dentry.tree.child) |child_node| {
+        const child = child_node.entry(fs.DEntry, "tree");
+        if (child.inode.mode.isDir()) {
+            try deleteRecursive(child);
+        } else {
+            if (child.inode.ops.unlink) |_unlink|
+                try _unlink(dentry.inode, child);
         }
     }
     if (dentry.inode.ops.rmdir) |_rmdir| {

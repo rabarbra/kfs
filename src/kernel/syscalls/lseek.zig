@@ -3,19 +3,17 @@ const arch = @import("arch");
 const dbg = @import("debug");
 const krn = @import("../main.zig");
 
-const SEEK_SET = 0;
-const SEEK_CUR = 1;
-const SEEK_END = 2;
-
 pub fn lseek(fd: u32, offset: isize, whence: u32) !usize {
     if (krn.task.current.files.fds.get(fd)) |file| {
+        file.ref.ref();
+        defer file.ref.unref();
         if (file.ops.lseek) |_lseek| {
             return try _lseek(file, offset, whence);
         }
         var new_pos: i64 = @intCast(offset);
         switch (whence) {
-            SEEK_CUR => new_pos = @as(i64, @intCast(file.pos)) + offset,
-            SEEK_END => new_pos = @as(i64, @intCast(file.inode.size)) + offset,
+            krn.fs.SEEK_CUR => new_pos = @as(i64, @intCast(file.pos)) + offset,
+            krn.fs.SEEK_END => new_pos = @as(i64, @intCast(file.inode.size)) + offset,
             else => {}
         }
         if (new_pos < 0 or new_pos > file.inode.size)

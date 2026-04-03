@@ -6,34 +6,28 @@ const kernel = @import("../main.zig");
 const errors = @import("./error-codes.zig").PosixError;
 
 pub fn doExit(error_code: i32) !u32 {
-    if (tsk.current == &tsk.initial_task) return errors.EINVAL;
-    const files: *kernel.fs.TaskFiles = tsk.current.files;
-    var it = files.map.iterator(.{.direction = .forward, .kind = .set});
-    while (it.next()) |idx| {
-        if (files.fds.fetchRemove(idx)) |kv| {
-            const file: *kernel.fs.File = kv.value;
-            // We only call close when no one is using the file
-            file.ref.unref(); // This should close and free the file if 0
-        }
-    }
-    tsk.current.files.fds.deinit();
-    tsk.current.files.map.deinit();
-    tsk.current.fs.pwd.release();
-    tsk.current.fs.root.release();
-    if (tsk.current.mm) |_mm| {
-        _mm.releaseMappings();
-    }
+    if (tsk.current == &tsk.initial_task)
+        return errors.EINVAL;
 
     tsk.current.result = error_code;
 
+    kernel.fs.procfs.deleteProcess(kernel.task.current);
+    kernel.task.current.refcount.unref();
+    while (kernel.task.current.refcount.getValue() > 1)
+        arch.archReschedule();
+
+    tsk.current.deinitAllocatedData();
     const lock_state = kernel.task.tasks_lock.lock_irq_disable();
+
     if (tsk.current.tree.parent) |p| {
         const parent = p.entry(tsk.Task, "tree");
         const act = parent.sighand.actions.get(.SIGCHLD);
 
         tsk.current.state = .ZOMBIE;
-        if (act.flags & signals.SA_NOCLDWAIT != 0)
+        if (act.flags & signals.SA_NOCLDWAIT != 0) {
+            tsk.current.refcount.ref();
             tsk.current.finish(true);
+        }
 
         tsk.current.wakeupParent(true);
         if (act.handler.handler != signals.sigIGN)

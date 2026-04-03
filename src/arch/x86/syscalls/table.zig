@@ -14,7 +14,7 @@ pub const SyscallHandler = fn (
 
 fn notImpl(_: u32, _: u32, _: u32, _: u32, _: u32, _: u32) !u32 {
     const state: *arch.Regs = @ptrFromInt(arch.gdt.tss.esp0 - @sizeOf(arch.Regs));
-    krn.logger.WARN("syscall {d} {s} is not implemented", .{
+    krn.logger.ERROR("syscall {d} {s} is not implemented", .{
         state.eax,
         @tagName(@as(Syscall, @enumFromInt(state.eax)))
     });
@@ -24,6 +24,7 @@ fn notImpl(_: u32, _: u32, _: u32, _: u32, _: u32, _: u32) !u32 {
 pub const SyscallTable = brk: {
     @setEvalBranchQuota(1700);
     break :brk std.EnumMap(Syscall, *const SyscallHandler).init(.{
+        .SYS_fallocate                  = &notImpl,
         .SYS_setup                      = &notImpl,
         .SYS_exit                       = @ptrCast(&krn.syscalls.exit.exit),
         .SYS_fork                       = @ptrCast(&krn.syscalls.fork.fork),
@@ -88,6 +89,7 @@ pub const SyscallTable = brk: {
         .SYS_geteuid                    = @ptrCast(&krn.syscalls.id.getEUID),
         .SYS_geteuid32                  = @ptrCast(&krn.syscalls.id.getEUID32),
         .SYS_getegid                    = @ptrCast(&krn.syscalls.id.getEGID),
+        .SYS_getegid32                  = @ptrCast(&krn.syscalls.id.getEGID32),
         .SYS_acct                       = &notImpl,
         .SYS_umount2                    = @ptrCast(&krn.syscalls.mount.umount2),
         .SYS_lock                       = &notImpl,
@@ -103,8 +105,8 @@ pub const SyscallTable = brk: {
         .SYS_ustat                      = &notImpl,
         .SYS_dup2                       = @ptrCast(&krn.syscalls.dup.dup2),
         .SYS_getppid                    = @ptrCast(&krn.syscalls.id.getPPID),
-        .SYS_getpgrp                    = &notImpl,
-        .SYS_setsid                     = &notImpl,
+        .SYS_getpgrp                    = @ptrCast(&krn.syscalls.id.getPGRP),
+        .SYS_setsid                     = @ptrCast(&krn.syscalls.id.setSID),
         .SYS_sigaction                  = @ptrCast(&krn.syscalls.sigaction.sigaction),
         .SYS_sgetmask                   = &notImpl,
         .SYS_ssetmask                   = &notImpl,
@@ -118,8 +120,8 @@ pub const SyscallTable = brk: {
         .SYS_getrusage                  = &notImpl,
         .SYS_gettimeofday               = &notImpl,
         .SYS_settimeofday               = &notImpl,
-        .SYS_getgroups                  = &notImpl,
-        .SYS_setgroups                  = &notImpl,
+        .SYS_getgroups                  = @ptrCast(&krn.syscalls.id.getgroups),
+        .SYS_setgroups                  = @ptrCast(&krn.syscalls.id.setgroups),
         .SYS_select                     = &notImpl,
         .SYS_symlink                    = @ptrCast(&krn.syscalls.symlink.symlink),
         .SYS_oldlstat                   = &notImpl,
@@ -133,7 +135,7 @@ pub const SyscallTable = brk: {
         .SYS_truncate                   = &notImpl,
         .SYS_ftruncate                  = &notImpl,
         .SYS_ftruncate64                = @ptrCast(&krn.syscalls.truncate.ftruncate64),
-        .SYS_fchmod                     = &notImpl,
+        .SYS_fchmod                     = @ptrCast(&krn.syscalls.chmod.fchmod),
         .SYS_fchown                     = &notImpl,
         .SYS_fchownat                    = @ptrCast(&krn.syscalls.chown.fchownat),
         .SYS_getpriority                = &notImpl,
@@ -190,7 +192,7 @@ pub const SyscallTable = brk: {
         .SYS_msync                      = &notImpl,
         .SYS_readv                      = @ptrCast(&krn.syscalls.read.readv),
         .SYS_writev                     = @ptrCast(&krn.syscalls.write.writev),
-        .SYS_getsid                     = &notImpl,
+        .SYS_getsid                     = @ptrCast(&krn.syscalls.id.getSID),
         .SYS_fdatasync                  = &notImpl,
         .SYS__sysctl                    = &notImpl,
         .SYS_mlock                      = &notImpl,
@@ -213,7 +215,7 @@ pub const SyscallTable = brk: {
         .SYS_nfsservctl                 = &notImpl,
         .SYS_prctl                      = &notImpl,
         .SYS_rt_sigreturn               = @ptrCast(&krn.syscalls.sigaction.rt_sigreturn),
-        .SYS_rt_sigaction               = @ptrCast(&krn.syscalls.sigaction.sigaction),
+        .SYS_rt_sigaction               = @ptrCast(&krn.syscalls.sigaction.rt_sigaction),
         .SYS_rt_sigprocmask             = @ptrCast(&krn.syscalls.sigaction.rt_sigprocmask),
         .SYS_rt_sigpending              = @ptrCast(&krn.syscalls.sigaction.rt_sigpending),
         .SYS_rt_sigtimedwait            = @ptrCast(&krn.syscalls.sigaction.rt_sigtimedwait),
@@ -224,6 +226,7 @@ pub const SyscallTable = brk: {
         .SYS_pwrite                     = &notImpl,
         .SYS_chown                      = &notImpl,
         .SYS_chown32                    = @ptrCast(&krn.syscalls.chown.chown32),
+        .SYS_fchown32                   = @ptrCast(&krn.syscalls.chown.fchown32),
         .SYS_getcwd                     = @ptrCast(&krn.syscalls.getcwd.getcwd),
         .SYS_capget                     = &notImpl,
         .SYS_capset                     = &notImpl,
@@ -245,7 +248,9 @@ pub const SyscallTable = brk: {
         .SYS_landlock_create_ruleset    = @ptrCast(&krn.syscalls.kshell.kshell),
         .SYS_setuid32                   = @ptrCast(&krn.syscalls.id.setUID),
         .SYS_setgid32                   = @ptrCast(&krn.syscalls.id.setGID),
-        .SYS_getgid32                   = @ptrCast(&krn.syscalls.id.getUID),
+        .SYS_getgroups32                = @ptrCast(&krn.syscalls.id.getgroups32),
+        .SYS_setgroups32                = @ptrCast(&krn.syscalls.id.setgroups32),
+        .SYS_getgid32                   = @ptrCast(&krn.syscalls.id.getGID),
         .SYS_stat64                     = @ptrCast(&krn.syscalls.stat.stat64),
         .SYS_lstat64                    = @ptrCast(&krn.syscalls.stat.lstat64),
         .SYS_fstat64                    = @ptrCast(&krn.syscalls.stat.fstat64),

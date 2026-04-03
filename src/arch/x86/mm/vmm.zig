@@ -180,26 +180,13 @@ pub const VMM = struct {
                 return addr_to_ret;
             }
         }
-        return 0xFFFFFFFF;
-    }
-
-    pub fn findFreeAddr(self: *VMM) u32 {
-        var pd_idx = PAGE_OFFSET >> 22;
-        while (pd_idx < 1023) : (pd_idx += 1) {
-            var pt_idx: u32 = 0;
-            if (current_page_dir[pd_idx] == 0) {
-                return pd_idx << 22;
+        krn.logger.ERROR("Could not find free space for {d} pages from {x} to {x} for user {}\n", .{
+                num_pages,
+                from_addr,
+                to_addr,
+                user
             }
-            if ((current_page_dir[pd_idx].huge_page) == 0) {
-                const pt: [*]PageEntry = first_page_table + (0x400 * pd_idx);
-                while (pt_idx < 1023) {
-                    if (pt[pt_idx] == 0) {
-                        return self.pageTableToAddr(pd_idx, pt_idx);
-                    }
-                    pt_idx += 1;
-                }
-            }
-        }
+        );
         return 0xFFFFFFFF;
     }
 
@@ -207,7 +194,7 @@ pub const VMM = struct {
         const pd_index = virt >> 22;
         const pt_index = (virt >> 12) & 0x3FF;
         const pt: [*]PageEntry = first_page_table + (0x400 * pd_index);
-        const pfn: u32 = pt[pt_index].address << 12;
+        const pfn: u32 = @as(u32, pt[pt_index].address) << 12;
         if (free_pfn)
             self.pmm.freePage(pfn);
         pt[pt_index].erase();
@@ -232,7 +219,9 @@ pub const VMM = struct {
             pd[pd_idx] = pt_pfn | @as(u12, @bitCast(flags)) | PAGE_WRITE;
             pt = @ptrCast(first_page_table);
             pt += (0x400 * pd_idx);
+            invalidatePage(@intFromPtr(pt));
             @memset(pt[0..1024], 0); // sets the whole PT to 0.
+            invalidatePage(@intFromPtr(pt));
         }
         pt = @ptrCast(first_page_table);
         pt += (0x400 * pd_idx);
@@ -299,6 +288,20 @@ pub const VMM = struct {
         self.unmapPage(pair.virt, false);
     }
 
+    /// Cleans up all the userspace related page tables in the given VAS.
+    pub fn deleteVASTables(self: *VMM, vas: u32) void {
+        const pair = self.mapVAS(vas);
+        const pd: [*]u32 = @ptrFromInt(pair.virt);
+        const kernel_pd: u32 = PAGE_OFFSET >> 22;
+        for (0..kernel_pd) |pd_idx| {
+            if (pd[pd_idx] != 0) {
+                const pt_phys: u32 = (pd[pd_idx] >> 12) << 12;
+                self.pmm.freePage(pt_phys);
+            }
+        }
+        self.unmapPage(pair.virt, false);
+    }
+
     pub fn dupPage(self: *VMM, old_pt: [*]u32, new_pt: [*]u32, pd_idx:u32, pt_idx: u32) !void {
         const new_page: u32 = self.pmm.allocPage();
         if (new_page == 0) // TODO error
@@ -359,6 +362,12 @@ pub const VMM = struct {
                 );
             }
 
+            const temp_addr = self.pageTableToAddr(temp_idx, 0);
+            defer {
+                pd[temp_idx] = 0;
+                invalidatePage(temp_addr);
+            }
+
             // Copy the values of old page table to new
             var old_pt: [*]u32 = @ptrCast(first_page_table);
             old_pt += 0x400 * pd_idx;
@@ -377,7 +386,6 @@ pub const VMM = struct {
                 }
             }
             pt_start_idx = 0;
-            pd[temp_idx] = 0;
         }
     }
 
@@ -392,7 +400,7 @@ pub const VMM = struct {
         // Calculate page-aligned boundaries for exclusive end
         // end is exclusive, so we need the last page that should be freed
         const last_addr = if (end > 0) end - 1 else 0;
-        
+
         const pd_start_idx: u32 = start >> 22;
         const pd_end_idx: u32 = last_addr >> 22;
 
@@ -439,5 +447,6 @@ pub const VMM = struct {
 
             pt_start_idx = 0;
         }
+        switchToVAS(krn.task.current.mm.?.vas);
     }
 };

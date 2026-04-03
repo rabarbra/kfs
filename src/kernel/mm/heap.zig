@@ -26,15 +26,15 @@ pub const FreeList = struct {
     head: ?*FreeListNode,
     vmm: *vmm,
     pmm: *pmm,
-    alignement: u8 = 16,
-    mtx: Mutex,
+    alignement: usize = 16,
+    mtx: krn.Spinlock,
 
     pub fn init(
         phys_mm: *pmm,
         virt_mm: *vmm,
         start_addr: usize,
         end_addr: usize,
-        alignement: u8,
+        alignement: usize,
     ) FreeList {
         return FreeList{
             .start_addr = start_addr,
@@ -43,7 +43,7 @@ pub const FreeList = struct {
             .vmm = virt_mm,
             .pmm = phys_mm,
             .alignement = alignement,
-            .mtx = Mutex.init(),
+            .mtx = krn.Spinlock.init(),
         };
     }
 
@@ -171,8 +171,8 @@ pub const FreeList = struct {
 
     pub fn free(self: *FreeList, addr: usize) void {
         var prev: ?*FreeListNode = undefined;
-        self.mtx.lock();
-        defer self.mtx.unlock();
+        const lock_state = krn.mm.mem_lock.lock_irq_disable();
+        defer krn.mm.mem_lock.unlock_irq_enable(lock_state);
         const header: ?*AllocHeader = self.getAllocHeader(addr);
         if (header == null)
             return;
@@ -194,9 +194,9 @@ pub const FreeList = struct {
         while (
             @intFromPtr(current) < @intFromPtr(new_node)
         ) : (current = current.?.next) {
-            if (@intFromPtr(new_node) < @intFromPtr(current.?.next))
-                return self.insertNewFreeNode(new_node, current.?, prev);
             if (current.?.next == null)
+                return self.insertNewFreeNode(new_node, current.?, prev);
+            if (@intFromPtr(new_node) < @intFromPtr(current.?.next))
                 return self.insertNewFreeNode(new_node, current.?, prev);
             prev = current;
         }
@@ -211,8 +211,8 @@ pub const FreeList = struct {
         // Total size of the block to allocate (including header)
         const total_size = self.alignToPtr(size + @sizeOf(AllocHeader));
 
-        self.mtx.lock();
-        defer self.mtx.unlock();
+        const lock_state = krn.mm.mem_lock.lock_irq_disable();
+        defer krn.mm.mem_lock.unlock_irq_enable(lock_state);
         // Try to find existing block (first fit)
         var buffer = self.head;
         var prev = self.head;

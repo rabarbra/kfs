@@ -33,22 +33,11 @@ fn processTasks() void {
             if (curr == tsk.stopped_tasks)
                 tsk.stopped_tasks = curr.next;
         }
-        krn.fs.procfs.deleteProcess(task);
         curr.del();
         task.delFromTree(); // Already done in task finish but safe
         task.mm.?.delete();
-        var file_it = task.files.map.iterator(.{});
-        while (file_it.next()) |id| {
-            if (id > 2) {
-                if (task.files.fds.get(id)) |file| {
-                    file.ref.unref();
-                }
-            }
-        }
-        krn.mm.kfree(task.files);
-
-        // TODO: think about filesystem data. (Unreffing root and pwd path).
         kthreadStackFree(task.stack_bottom);
+        tsk.releasePid(task.pid);
         km.kfree(task);
         if (end)
             break;
@@ -74,9 +63,8 @@ fn findNextTask() *tsk.Task {
         }
         if (task.state == .INTERRUPTIBLE_SLEEP and task.sighand.hasPending())
             task.state = .RUNNING;
-        if (task.state == .RUNNING) {
+        if (task.state == .RUNNING)
             return task;
-        }
     }
     return &tsk.initial_task;
 }
