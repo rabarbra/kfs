@@ -148,3 +148,53 @@ pub const Iterator = struct {
         }
     }
 };
+
+// ---- inline unit tests ----
+
+const testing = @import("std").testing;
+
+test "setup yields no children, no siblings" {
+    var n = TreeNode.init();
+    n.setup();
+    try testing.expect(!n.hasChildren());
+    try testing.expect(!n.hasSiblings());
+    try testing.expectEqual(@as(u32, 0), n.childrenCount());
+}
+
+test "addSibling creates ring of two" {
+    var a = TreeNode.init();
+    a.setup();
+    var b = TreeNode.init();
+    b.setup();
+    a.addSibling(&b);
+    try testing.expect(a.hasSiblings());
+    try testing.expect(b.hasSiblings());
+    try testing.expectEqual(&b, a.next.?);
+    try testing.expectEqual(&a, b.next.?);
+}
+
+test "addChild attaches child and sets its parent" {
+    var p = TreeNode.init();
+    p.setup();
+    var c = TreeNode.init();
+    c.setup();
+    p.addChild(&c);
+    try testing.expect(p.hasChildren());
+    try testing.expectEqual(&p, c.parent.?);
+    try testing.expectEqual(&c, p.child.?);
+    try testing.expectEqual(@as(u32, 1), p.childrenCount());
+}
+
+test "addChild on existing parent appends as sibling" {
+    var p = TreeNode.init();
+    p.setup();
+    var c1 = TreeNode.init();
+    c1.setup();
+    var c2 = TreeNode.init();
+    c2.setup();
+    p.addChild(&c1);
+    p.addChild(&c2);
+    try testing.expectEqual(@as(u32, 2), p.childrenCount());
+    try testing.expectEqual(&p, c1.parent.?);
+    try testing.expectEqual(&p, c2.parent.?);
+}

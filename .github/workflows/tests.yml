@@ -1,0 +1,186 @@
+name: tests
+
+# Push covers every branch (including PR branches). Listening on
+# `pull_request` too would double-trigger every PR run.
+on:
+  push:
+    branches: ['**']
+
+# Cancel an older in-flight run when a new commit lands on the same ref.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install build/test deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            grub-pc-bin grub-common xorriso \
+            mtools e2fsprogs gdisk \
+            wget make python3
+
+      # ---------------- unit (host) ----------------
+      - name: Unit tests
+        id: unit
+        shell: bash
+        run: |
+          set -o pipefail
+          rc=0
+          make test-unit 2>&1 | tee unit.log || rc=$?
+          # Zig prints e.g. "17 pass (17 total)"
+          line=$(grep -Eo '[0-9]+ pass(ed)?( \([0-9]+ total\))?' unit.log | tail -1 || true)
+          passed=$(echo "$line" | awk '{print $1}')
+          total=$(echo "$line" | grep -Eo '[0-9]+ total' | awk '{print $1}')
+          : "${passed:=0}"
+          : "${total:=$passed}"
+          echo "passed=$passed" >>"$GITHUB_OUTPUT"
+          echo "total=$total"   >>"$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::unit tests failed: $passed / $total"
+            exit "$rc"
+          fi
+          echo "::notice::unit tests: $passed / $total"
+
+      # ---------------- in-kernel (qemu) ----------------
+      - name: Kernel tests
+        id: kernel
+        shell: bash
+        run: |
+          set -o pipefail
+          rc=0
+          make test-kernel 2>&1 | tee kernel.log || rc=$?
+          line=$(grep -Eo 'summary: [0-9]+ passed, [0-9]+ failed' kernel.log | tail -1 || true)
+          passed=$(echo "$line" | awk '{print $2}')
+          failed=$(echo "$line" | awk '{print $4}')
+          : "${passed:=0}"
+          : "${failed:=0}"
+          total=$(( passed + failed ))
+          echo "passed=$passed" >>"$GITHUB_OUTPUT"
+          echo "total=$total"   >>"$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::kernel tests failed: $passed / $total (failed: $failed)"
+            grep -E "^\[KUNIT\] FAIL" kernel.log || true
+            exit "$rc"
+          fi
+          echo "::notice::kernel tests: $passed / $total"
+
+      # ---------------- integration (qemu + rootfs) ----------------
+      - name: Cache base rootfs (tar + extracted image)
+        uses: actions/cache@v4
+        with:
+          path: |
+            rootfs_min.tar.gz
+            release/build/rootfs-min.img
+          key: rootfs-min-v1
+
+      - name: Integration tests
+        id: integration
+        shell: bash
+        run: |
+          set -o pipefail
+          rc=0
+          make test-integration 2>&1 | tee integration.log || rc=$?
+          line=$(grep -Eo 'summary: [0-9]+ passed, [0-9]+ failed' integration.log | tail -1 || true)
+          passed=$(echo "$line" | awk '{print $2}')
+          failed=$(echo "$line" | awk '{print $4}')
+          : "${passed:=0}"
+          : "${failed:=0}"
+          total=$(( passed + failed ))
+          echo "passed=$passed" >>"$GITHUB_OUTPUT"
+          echo "total=$total"   >>"$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::integration tests failed: $passed / $total (failed: $failed)"
+            grep -E "^\[ITEST\] FAIL" integration.log || true
+            tail -30 integration.log
+            exit "$rc"
+          fi
+          echo "::notice::integration tests: $passed / $total"
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        env:
+          U_PASS:  ${{ steps.unit.outputs.passed }}
+          U_TOTAL: ${{ steps.unit.outputs.total }}
+          K_PASS:  ${{ steps.kernel.outputs.passed }}
+          K_TOTAL: ${{ steps.kernel.outputs.total }}
+          I_PASS:  ${{ steps.integration.outputs.passed }}
+          I_TOTAL: ${{ steps.integration.outputs.total }}
+        run: |
+          row() {
+            label=$1; pass=${2:-?}; total=${3:-?}
+            mark="❌"
+            if [ "$pass" = "$total" ] && [ "$pass" != "0" ] && [ "$pass" != "?" ]; then mark="✅"; fi
+            echo "| $label | $pass / $total | $mark |"
+          }
+          {
+            echo "### Test results"
+            echo
+            echo "| layer | passed | status |"
+            echo "|---|---|---|"
+            row "unit"        "$U_PASS" "$U_TOTAL"
+            row "kernel"      "$K_PASS" "$K_TOTAL"
+            row "integration" "$I_PASS" "$I_TOTAL"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      # ---------------- publish shields.io endpoint JSONs (main only) ----------------
+      - name: Publish badges
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          U_PASS:  ${{ steps.unit.outputs.passed }}
+          U_TOTAL: ${{ steps.unit.outputs.total }}
+          K_PASS:  ${{ steps.kernel.outputs.passed }}
+          K_TOTAL: ${{ steps.kernel.outputs.total }}
+          I_PASS:  ${{ steps.integration.outputs.passed }}
+          I_TOTAL: ${{ steps.integration.outputs.total }}
+        run: |
+          set -e
+          color() {
+            if [ "$1" = "$2" ] && [ "$1" != "0" ]; then echo brightgreen
+            elif [ "$1" = "0" ]; then echo red
+            else echo yellow; fi
+          }
+          mk() {
+            label="$1"; pass="$2"; total="$3"; out="$4"
+            cat >"$out" <<EOF
+          {
+            "schemaVersion": 1,
+            "label": "$label",
+            "message": "$pass / $total",
+            "color": "$(color "$pass" "$total")"
+          }
+          EOF
+          }
+          tmp="$(mktemp -d)"
+          mk "unit tests"        "$U_PASS" "$U_TOTAL" "$tmp/unit.json"
+          mk "kernel tests"      "$K_PASS" "$K_TOTAL" "$tmp/kernel.json"
+          mk "integration tests" "$I_PASS" "$I_TOTAL" "$tmp/integration.json"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Orphan branch holding only the badge JSONs. Force-push to keep
+          # history shallow.
+          git checkout --orphan badges
+          git rm -rf --quiet . || true
+          mv "$tmp"/*.json .
+          git add unit.json kernel.json integration.json
+          git commit -m "badges: $(date -u +%Y-%m-%dT%H:%M:%SZ)" --quiet
+          git push origin badges --force

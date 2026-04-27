@@ -40,6 +40,9 @@ pub const currentMs = @import("./time/jiffies.zig").currentMs;
 pub const jiffies = @import("./time/jiffies.zig");
 pub const errors = @import("./syscalls/error-codes.zig");
 
+// In-kernel test runner (only invoked when built with -Dtest=true).
+pub const tests = @import("./tests/main.zig");
+
 pub const socket = @import("./net/socket.zig");
 
 pub var keyboard: *kbd.Keyboard = &kbd.keyboard;

@@ -278,10 +278,25 @@ install-tools:
 	fi
 	@$(MAKE) check-tools
 
+# === Tests ===
+test-unit:
+	zig build test --summary all
+
+test-kernel:
+	zig build -Dtest=true
+	bash scripts/run_qemu_tests.sh
+
+test-integration: $(ROOTFS_MIN_IMG)
+	bash scripts/run_integration_tests.sh
+
+test: test-unit test-kernel test-integration
+	@echo "all test layers passed"
+
 .PHONY: all clean fclean qemu debug modules build-image \
 	prepare-rootfs \
 	release-full release-min release-kernel release-all \
 	check-tools \
 	tools-linux-apt tools-linux-dnf tools-linux-pacman \
 	tools-linux-apk tools-linux-root tools-user-brew \
-	install-tools-user install-tools-system install-tools
+	install-tools-user install-tools-system install-tools \
+	test test-unit test-kernel test-integration
