@@ -1,5 +1,10 @@
 # KFS
 
+[![tests](https://github.com/rabarbra/kfs/actions/workflows/tests.yml/badge.svg)](https://github.com/rabarbra/kfs/actions/workflows/tests.yml)
+[![unit](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rabarbra/kfs/badges/unit.json)](https://github.com/rabarbra/kfs/actions/workflows/tests.yml)
+[![kernel](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rabarbra/kfs/badges/kernel.json)](https://github.com/rabarbra/kfs/actions/workflows/tests.yml)
+[![integration](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rabarbra/kfs/badges/integration.json)](https://github.com/rabarbra/kfs/actions/workflows/tests.yml)
+
 A minimalistic kernel written in Zig.
 
 - [x] kfs-1

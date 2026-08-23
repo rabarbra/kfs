@@ -16,6 +16,13 @@ pub fn build(b: *std.Build) !void {
         "arch",
         "Provide cpu architecture. We support: x86, x86_64.\n"
     ) orelse "x86";
+    const is_test = b.option(
+        bool,
+        "test",
+        "Build a kernel that runs the in-kernel test suite at boot, then exits QEMU."
+    ) orelse false;
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "is_test", is_test);
     var tmp_arch: ?std.Target.Cpu.Arch = null;
     for (archs) |_arch| {
         var buf: [10]u8 = undefined;
@@ -145,6 +152,7 @@ pub fn build(b: *std.Build) !void {
     kernel.root_module.addImport("debug", debug_mod);
     kernel.root_module.addImport("kernel", kernel_mod);
     kernel.root_module.addImport("modules", modules_mod);
+    kernel.root_module.addImport("build_options", build_options.createModule());
 
     if (arch == .x86) {
         kernel.setLinkerScript(b.path("./src/arch/x86/linker.ld"));
@@ -182,4 +190,14 @@ pub fn build(b: *std.Build) !void {
     }
     kernel_step.dependOn(&kernel.step);
     b.installArtifact(kernel);
+
+    const test_root = b.createModule(.{
+        .root_source_file = b.path("src/test_root.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const unit_tests = b.addTest(.{ .root_module = test_root });
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    const test_step = b.step("test", "Run host-side unit tests");
+    test_step.dependOn(&run_unit_tests.step);
 }

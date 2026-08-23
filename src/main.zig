@@ -22,6 +22,7 @@ const std = @import("std");
 const cpu = @import("arch").cpu;
 const io = @import("arch").io;
 const modules = @import("modules");
+const build_options = @import("build_options");
 
 pub fn panic(
     msg: []const u8,
@@ -225,6 +226,9 @@ export fn kernel_main(magic: u32, address: u32) noreturn {
         @panic("Modules file cannot be created\n");
     };
     krn.serial.print("[INIT]: Modules done\n");
+    if (build_options.is_test) {
+        krn.tests.runAll();
+    }
     move_root();
     krn.serial.print("[INIT]: Moved /\n");
     kernel_ready = true;

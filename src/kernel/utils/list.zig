@@ -114,3 +114,92 @@ pub fn listMap(
         f(containerOf(T, @intFromPtr(buf.?), member));
     }
 }
+
+// ---- inline unit tests (run via `zig build test`) ----
+
+const testing = @import("std").testing;
+
+test "ListHead setup makes self-referential, isEmpty true" {
+    var h = ListHead.init();
+    h.setup();
+    try testing.expect(h.isEmpty());
+    try testing.expectEqual(&h, h.next.?);
+    try testing.expectEqual(&h, h.prev.?);
+}
+
+test "add inserts after head; isEmpty becomes false" {
+    var h = ListHead.init();
+    h.setup();
+    var n = ListHead.init();
+    n.setup();
+    h.add(&n);
+    try testing.expect(!h.isEmpty());
+    try testing.expectEqual(&n, h.next.?);
+    try testing.expectEqual(&h, n.prev.?);
+}
+
+test "del unlinks and clears pointers" {
+    var h = ListHead.init();
+    h.setup();
+    var n = ListHead.init();
+    n.setup();
+    h.add(&n);
+    n.del();
+    try testing.expect(h.isEmpty());
+    try testing.expect(n.prev == null);
+    try testing.expect(n.next == null);
+}
+
+test "iterator visits inserted nodes once" {
+    var h = ListHead.init();
+    h.setup();
+    var a = ListHead.init();
+    a.setup();
+    var b = ListHead.init();
+    b.setup();
+    var c = ListHead.init();
+    c.setup();
+    h.add(&a);
+    h.add(&b);
+    h.add(&c);
+    var it = h.iterator();
+    var seen: usize = 0;
+    while (it.next()) |_| : (seen += 1) {
+        if (seen > 8) break;
+    }
+    try testing.expectEqual(@as(usize, 4), seen);
+}
+
+test "containerOf recovers parent struct pointer" {
+    const S = struct { a: u32, link: ListHead, b: u32 };
+    var s = S{ .a = 1, .link = ListHead.init(), .b = 2 };
+    const recovered = containerOf(S, @intFromPtr(&s.link), "link");
+    try testing.expectEqual(&s, recovered);
+    try testing.expectEqual(@as(u32, 1), recovered.a);
+    try testing.expectEqual(@as(u32, 2), recovered.b);
+}
+
+test "addTail puts node at the end" {
+    var h = ListHead.init();
+    h.setup();
+    var a = ListHead.init();
+    a.setup();
+    var b = ListHead.init();
+    b.setup();
+    h.addTail(&a);
+    h.addTail(&b);
+    // After two tail-adds: head -> a -> b -> head
+    try testing.expectEqual(&a, h.next.?);
+    try testing.expectEqual(&b, h.prev.?);
+}
+
+test "iterator on empty list visits only the head sentinel" {
+    var h = ListHead.init();
+    h.setup();
+    var it = h.iterator();
+    var seen: usize = 0;
+    while (it.next()) |_| : (seen += 1) {
+        if (seen > 4) break;
+    }
+    try testing.expectEqual(@as(usize, 1), seen);
+}
