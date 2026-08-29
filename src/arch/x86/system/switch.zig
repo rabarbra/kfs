@@ -4,8 +4,7 @@ const gdt = @import("../gdt.zig");
 const idt = @import("../idt.zig");
 const vmm = @import("../mm/vmm.zig");
 const fpu = @import("../fpu.zig");
-
-extern const stack_top: u32;
+const smp = @import("../smp/main.zig");
 
 // switch_to(prev_save: *u32, next_sp: u32)
 //
@@ -93,26 +92,26 @@ pub fn contextSwitch(prev: *tsk.Task, next: *tsk.Task) void {
         }
         prev.save_fpu_state = false;
     }
-    tsk.current = next;
-    if (next == &tsk.initial_task) {
-        gdt.tss.esp0 = @intFromPtr(&stack_top);
+    if (next == tsk.initial_task.ptr()) {
+        gdt.tss.ptr().esp0 = krn.task.stack_top.get();
     } else {
-        gdt.tss.esp0 = next.stack_bottom + krn.STACK_SIZE;
+        gdt.tss.ptr().esp0 = next.stack_bottom + krn.STACK_SIZE;
     }
+    if (prev.mm) |_mm| {
+        _mm.unsetCPU(smp.logical_id.get());
+    }
+
     vmm.switchToVAS(next.mm.?.vas);
 
-    gdt.gdtSetEntry(
-        next.tls_entry_number,
+    gdt.gdt_entries.ptr()[next.tls_entry_number].set(
         next.tls,
         next.limit,
         next.tls_access,
         next.tls_gran,
     );
-    asm volatile (
-        "mov %[_sel], %gs"
-        :: [_sel]"r"(@as(u16, idt.KERNEL_DATA_SEGMENT))
-        : .{ .memory = true}
-    );
-
+    tsk.current_task.set(next);
+    if (next.mm) |_mm| {
+        _mm.setCPU(smp.logical_id.get());
+    }
     switch_to(&prev.kernel_esp, next.kernel_esp);
 }

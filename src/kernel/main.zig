@@ -24,6 +24,7 @@ pub const RefCount = @import("./utils/refcount.zig").RefCount;
 
 pub const kthreadCreate = @import("./sched/kthread.zig").kthreadCreate;
 pub const kthreadStop = @import("./sched/kthread.zig").kthreadStop;
+pub const kthread = @import("sched/kthread.zig");
 pub const STACK_SIZE = @import("sched/kthread.zig").STACK_SIZE;
 pub const task = @import("./sched/task.zig");
 pub const thread = @import("./sched/thread.zig");
@@ -44,6 +45,7 @@ pub const errors = @import("./syscalls/error-codes.zig");
 
 pub const socket = @import("./net/socket.zig");
 pub const limit = @import("./sched/rlimit.zig");
+pub const random = @import("./random.zig");
 
 pub var keyboard: *kbd.Keyboard = &kbd.keyboard;
 pub var pit: PIT = undefined;

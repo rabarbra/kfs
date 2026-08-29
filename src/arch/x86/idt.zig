@@ -4,18 +4,22 @@ const dbg = @import("debug");
 const drv = @import("drivers");
 const krn = @import("kernel");
 const printf = @import("debug").printf;
+const cpu = @import("system/cpu.zig");
 const Regs = @import("system/cpu.zig").Regs;
 const signals = @import("kernel").signals;
 const tsk = @import("kernel").task;
 const gdt = @import("./gdt.zig");
 const vmm = @import("./mm/vmm.zig");
 const fpu = @import("fpu.zig");
+const smp = @import("./smp/main.zig");
 
 pub const IDT_MAX_DESCRIPTORS   = 256;
+pub const MAX_SYSTEM_INTERRUPTS = 240;
 pub const CPU_EXCEPTION_COUNT   = 32;
 
 pub const SYSCALL_INTERRUPT = 0x80;
 pub const TIMER_INTERRUPT   = 0x20;
+pub const TLB_INTERRUPT     = 0xF0;
 
 pub const KERNEL_CODE_SEGMENT   = 0x08;
 pub const KERNEL_DATA_SEGMENT   = 0x10;
@@ -26,14 +30,12 @@ const ExceptionHandler  = fn (regs: *Regs) *Regs;
 const SyscallHandler    = fn (regs: *Regs) void;
 const ISRHandler        = fn (arg: ?*anyopaque) callconv(.c) void;
 
-extern const stack_top: u32;
-
 pub fn goUserspace() void {
     // TSS.esp0 represents the kernel stack pointer to switch to when the CPU enters
     // ring 0 from a lower privilege level (ring 3).
     // For a new task this should always be the top of the kernel stack that was
     // allocated for this new task.
-    gdt.tss.esp0 = krn.task.current.stack_bottom + krn.STACK_SIZE;
+    gdt.tss.ptr().esp0 = krn.task.current().stack_bottom + krn.STACK_SIZE;
     asm volatile(
         \\ cli
         \\ mov $((8 * 4) | 3), %%bx
@@ -53,17 +55,18 @@ pub fn goUserspace() void {
         \\ iret
         \\
         ::
-        [uc] "r" (krn.task.current.mm.?.code),
-        [us] "r" (krn.task.current.mm.?.argc),
+        [uc] "r" (krn.task.current().mm.?.code),
+        [us] "r" (krn.task.current().mm.?.argc),
     );
 }
 
 pub export fn exceptionHandler(state: *Regs) callconv(.c) *Regs {
+    var regs = state;
     if (krn.irq.handlers[state.int_no] != null) {
         const handler: *const ExceptionHandler = @ptrCast(krn.irq.handlers[state.int_no].?);
-        return handler(state);
+        regs = handler(state);
     }
-    return state;
+    return processSignalsHelper(regs);
 }
 
 pub export fn irqHandler(state: *Regs) callconv(.c) *Regs {
@@ -78,21 +81,20 @@ pub export fn irqHandler(state: *Regs) callconv(.c) *Regs {
             handler(arg);
         }
     }
-    io.outb(0x20, 0x20);
-    if (state.int_no >= 40) {
-        io.outb(0xA0, 0x20);
-    }
-    if (state.int_no == TIMER_INTERRUPT)
-        krn.sched.schedule();
 
+    cpu.operations.sendEOI(state.int_no);
+    if (state.int_no == TIMER_INTERRUPT) {
+        krn.jiffies.accountTick(state);
+        krn.sched.schedule();
+    }
     _ = processSignalsHelper(state);
 
     return state;
 }
 
 pub export fn processSignalsHelper(regs: *Regs) callconv(.c) *Regs {
-    if (tsk.current.tsktype != .KTHREAD) {
-        return signals.processSignals(regs, krn.task.current.sigmask);
+    if (tsk.current().tsktype != .KTHREAD) {
+        return signals.processSignals(regs, krn.task.current().sigmask);
     }
     return regs;
 }
@@ -143,7 +145,6 @@ pub const push_regs: []const u8 =
 \\    mov %ax, %ds
 \\    mov %ax, %es
 \\    mov %ax, %fs
-\\    mov %ax, %gs
 \\
 ;
 
@@ -171,6 +172,8 @@ pub fn generateIRQStub(comptime n: u8) []const u8 {
         \\ push $0
         \\ push ${d}
         \\ {s}
+        \\ mov $0x{x}, %ax
+        \\ mov %ax, %gs
         \\ mov %esp, %eax
         \\ push %eax
         \\ lea irqHandler, %eax
@@ -186,6 +189,7 @@ pub fn generateIRQStub(comptime n: u8) []const u8 {
             kernel_entry_clear_flags,
             n,
             push_regs,
+            gdt.GS_OFFSET,
             pop_regs
         }
     );
@@ -200,6 +204,8 @@ fn generateStub(comptime n: u8, comptime has_error: bool) []const u8 {
         \\ {s}
         \\ push ${d}
         \\ {s}
+        \\ mov $0x{x}, %ax
+        \\ mov %ax, %gs
         \\ mov %esp, %eax
         \\ push %eax
         \\ lea exceptionHandler, %eax
@@ -216,6 +222,7 @@ fn generateStub(comptime n: u8, comptime has_error: bool) []const u8 {
             if (has_error) "" else "push $0",
             n,
             push_regs,
+            gdt.GS_OFFSET,
             pop_regs,
         }
     );
@@ -291,6 +298,11 @@ pub inline fn PICRemap() void {
     io.outb(0xA1, 0x0);
 }
 
+pub inline fn PICMask() void {
+    io.outb(0x21, 0xFF);
+    io.outb(0xA1, 0xFF);
+}
+
 const IdtEntry = packed struct {
     isr_low: u16,       // The lower 16 bits of the ISR's address
     kernel_cs: u16,     // The GDT segment selector that the CPU will load into CS before calling the ISR
@@ -317,6 +329,14 @@ pub fn idtSetDescriptor(vector: u8, isr: *const ISRHandler, flags: u8) void {
     descriptor.reserved       = 0;
 }
 
+pub inline fn idtLoad() void {
+    asm volatile (
+        \\lidt (%[idt_ptr])
+        :
+        : [idt_ptr] "r" (&idtr),
+    );
+}
+
 pub fn idtInit() void {
     idtr.base = @intFromPtr(&idt[0]);
     idtr.limit = idt.len * @sizeOf(IdtEntry) - 1;
@@ -334,15 +354,13 @@ pub fn idtInit() void {
         idtSetDescriptor(
             @intCast(index),
             isr_stub_table[index],
-            if (index < CPU_EXCEPTION_COUNT) 0x8E else 0xEE
+            if (index < CPU_EXCEPTION_COUNT or index == TLB_INTERRUPT)
+                0x8E
+            else
+                0xEE
         );
     }
-
-    asm volatile (
-        \\lidt (%[idt_ptr])
-        :
-        : [idt_ptr] "r" (&idtr),
-    );
+    idtLoad();
     PICRemap();
     krn.exceptions.registerExceptionHandlers();
 }

@@ -50,7 +50,7 @@ pub const WaitQueueHead = struct {
         interruptable: bool,
         timeout: u32
     ) void {
-        const tsk = krn.task.current;
+        const tsk = krn.task.current();
         var node = WaitQueueNode.init(tsk);
         node.setup();
         var lock_state = self.lock.lock_irq_disable();
@@ -72,6 +72,41 @@ pub const WaitQueueHead = struct {
 
         lock_state = self.lock.lock_irq_disable();
         defer self.lock.unlock_irq_enable(lock_state);
+        if (!node.list.isEmpty())
+            node.list.del();
+    }
+
+    // same as wait() but with lock passed to unlock before reschedule
+    pub fn waitAndUnlock(
+        self: *WaitQueueHead,
+        interruptable: bool,
+        timeout: u32,
+        lock: *krn.Spinlock,
+        lock_state: bool,
+    ) void {
+        const tsk = krn.task.current();
+        var node = WaitQueueNode.init(tsk);
+        node.setup();
+        var _lock_state = self.lock.lock_irq_disable();
+        self.list.addTail(&node.list);
+
+        if (timeout != 0) {
+            tsk.wakeup_time = krn.currentMs() + timeout;
+        } else {
+            tsk.wakeup_time = 0;
+        }
+        if (interruptable) {
+            tsk.state = .INTERRUPTIBLE_SLEEP;
+        } else {
+            tsk.state = .UNINTERRUPTIBLE_SLEEP;
+        }
+        self.lock.unlock_irq_enable(_lock_state);
+        lock.unlock_irq_enable(lock_state);
+
+        krn.sched.reschedule();
+
+        _lock_state = self.lock.lock_irq_disable();
+        defer self.lock.unlock_irq_enable(_lock_state);
         if (!node.list.isEmpty())
             node.list.del();
     }

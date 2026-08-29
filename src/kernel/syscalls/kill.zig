@@ -15,7 +15,7 @@ fn send_signal(_task: *tsk.Task, signal: i32, tid: u32) !u32 {
             return errors.ESRCH;
         }
     }
-    if (tsk.current.uid != task.uid)
+    if (tsk.current().uid != task.uid)
         return errors.EPERM;
     if (signal == 0)
         return 0;
@@ -49,11 +49,11 @@ pub fn doKill(pid: i32, sig: i32, tid: u32) !u32 {
         const lock_state = tsk.tasks_lock.lock_irq_disable();
         defer tsk.tasks_lock.unlock_irq_enable(lock_state);
 
-        var it = tsk.initial_task.list.iterator();
+        var it = tsk.processTreeRoot().tree.treeIterator();
         var count: i32 = 0;
-        const pgroup: u32 = if (pid < -1) @intCast(-pid) else tsk.current.pgid;
+        const pgroup: u32 = if (pid < -1) @intCast(-pid) else tsk.current().pgid;
         while (it.next()) |i| {
-            const task = i.curr.entry(tsk.Task, "list");
+            const task = i.entry(tsk.Task, "tree");
             if (task.pgid == pgroup) {
                 _ = send_signal(task, sig, tid) catch {};
             }
@@ -64,10 +64,10 @@ pub fn doKill(pid: i32, sig: i32, tid: u32) !u32 {
         const lock_state = tsk.tasks_lock.lock_irq_disable();
         defer tsk.tasks_lock.unlock_irq_enable(lock_state);
 
-        var it = tsk.initial_task.list.iterator();
+        var it = tsk.processTreeRoot().tree.treeIterator();
         var count: i32 = 0;
         while (it.next()) |i| {
-            const task = i.curr.entry(tsk.Task, "list");
+            const task = i.entry(tsk.Task, "tree");
             if (task.pid == 0)
                 continue ;
             if (tid == 0 and task.pid == 1)
@@ -84,11 +84,11 @@ pub fn doKill(pid: i32, sig: i32, tid: u32) !u32 {
             }
         }
         return if (count == 0) errors.ESRCH else 0;
-    } else if (tsk.initial_task.findByPid(@intCast(pid))) |task| {
+    } else if (tsk.processTreeRoot().findByPid(@intCast(pid))) |task| {
         defer task.refcount.put();
         return try send_signal(task, sig, tid);
     }
-    return errors.EPERM;
+    return errors.ESRCH;
 }
 
 pub fn kill(pid: i32, sig: i32) !u32 {

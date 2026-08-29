@@ -53,6 +53,7 @@ pub const File = struct {
         self.inode.ref.get();
         self.data = null;
         self.mode = fs.UMode{};
+        self.flags = 0;
     }
 
     pub fn release(ref: *kernel.RefCount) void {
@@ -117,6 +118,7 @@ pub const TaskFiles = struct {
     map: std.DynamicBitSet,
     closexec: std.DynamicBitSet,
     fds: std.AutoHashMap(usize, *File),
+    lock: kernel.Spinlock = kernel.Spinlock.init(),
     ref: kernel.RefCount = kernel.RefCount.init(),
 
     pub fn new() ?*TaskFiles {
@@ -130,6 +132,7 @@ pub const TaskFiles = struct {
                 return null;
             };
             files.fds = std.AutoHashMap(usize, *File).init(kernel.mm.kernel_allocator.allocator());
+            files.lock = kernel.Spinlock.init();
             files.ref = kernel.RefCount.init();
             files.ref.get();
             files.ref.dropFn = release;
@@ -164,6 +167,9 @@ pub const TaskFiles = struct {
             return kernel.errors.PosixError.ENOMEM;
         errdefer kernel.mm.kfree(self);
 
+        old.lock.lock();
+        defer old.lock.unlock();
+
         var fd_it = old.map.iterator(.{});
         while (fd_it.next()) |id| {
             if (id > self.map.capacity()) {
@@ -193,16 +199,25 @@ pub const TaskFiles = struct {
     }
 
     pub fn releaseFD(self: *TaskFiles, fd: usize) bool {
-        self.unsetFD(fd);
-        if (self.fds.get(fd)) |file| {
-            _ = self.fds.remove(fd);
-            file.ref.put();
+        var file: ?*File = null;
+
+        self.lock.lock();
+        self.unsetFDLocked(fd);
+        if (self.fds.fetchRemove(fd)) |entry|
+            file = entry.value;
+        self.lock.unlock();
+
+        if (file) |_file| {
+            _file.ref.put();
             return true;
         }
         return false;
     }
 
     pub fn getNextFD(self: *TaskFiles) anyerror!usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+
         var it = self.map.iterator(.{
             .kind = .unset,
             .direction = .forward,
@@ -219,6 +234,9 @@ pub const TaskFiles = struct {
     }
 
     pub fn getNextFromFD(self: *TaskFiles, from_fd: usize) !usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+
         if (from_fd >= self.map.capacity()) {
             self.map.resize(from_fd + 1, false) catch |err| {
                 kernel.logger.ERROR(
@@ -240,7 +258,7 @@ pub const TaskFiles = struct {
             .direction = .forward,
         });
         while (it.next()) |index| {
-            if (index > from_fd) {
+            if (index >= from_fd) {
                 self.map.set(index);
                 return index;
             }
@@ -249,6 +267,12 @@ pub const TaskFiles = struct {
     }
 
     pub fn unsetFD(self: *TaskFiles, fd: usize) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.unsetFDLocked(fd);
+    }
+
+    fn unsetFDLocked(self: *TaskFiles, fd: usize) void {
         if (fd < self.map.capacity()) {
             self.map.unset(fd);
             self.closexec.unset(fd);
@@ -256,6 +280,9 @@ pub const TaskFiles = struct {
     }
 
     pub fn setFD(self: *TaskFiles, fd: usize, file: *File) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
         if (fd >= self.map.capacity()) {
             self.map.resize(fd + 1, false) catch |err| {
                 kernel.logger.ERROR(

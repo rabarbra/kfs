@@ -50,6 +50,20 @@ pub const arch = struct {
     };
 
     pub const gdt = struct {
+        pub const gdt_ptr = struct {
+        };
+
+        pub const tss = struct {
+        };
+
+        pub const gdt_entries = struct {
+        };
+
+        pub const Gdtr = packed struct {
+            limit : u16= 0,
+            base : u32= 0,
+        };
+
         pub const GdtEntry = packed struct {
             limit_low : u16,
             base_low : u16,
@@ -304,6 +318,10 @@ pub const arch = struct {
             phys : u32= 0,
         };
 
+        pub const tlb_ack = struct {
+        };
+
+        pub extern fn shootdownTLB()void;
         pub const VMM = struct {
             pmm : *arch.pmm.PMM,
         };
@@ -392,6 +410,11 @@ pub const arch = struct {
             ldt : u16,
             trace : u16,
             bitmap : u16,
+        };
+
+        pub const Operations = struct {
+            sendEOI : *const fn(u32) void,
+            sendIPI : ?*const fn(u32, u8) void= null,
         };
 
     };
@@ -602,6 +625,33 @@ pub const arch = struct {
 
     };
 
+    pub const acpi = struct {
+        pub const SDTHeader = extern struct {
+            Signature : [4]u8,
+            Length : u32,
+            Revision : u8,
+            Checksum : u8,
+            OEMID : [6]u8,
+            OEMTableID : [8]u8,
+            OEMRevision : u32,
+            CreatorID : u32,
+            CreatorRevision : u32,
+        };
+
+        pub const RSDT = extern struct {
+            header : arch.acpi.SDTHeader,
+        };
+
+        pub const RSDPDescriptor = extern struct {
+            signature : [8]u8,
+            checksum : u8,
+            oem_id : [6]u8,
+            revision : u8,
+            rsdt_address : u32,
+        };
+
+    };
+
     pub const sw = struct {
     };
 
@@ -616,6 +666,83 @@ pub const arch = struct {
 
         };
 
+    };
+
+    pub const smp = struct {
+
+        pub const apic = struct {
+            pub const ApicBaseMsr = packed struct {
+                reserved0 : u8= 0,
+                is_bsp : bool= false,
+                reserved1 : u1= 0,
+                x2apic_enable : bool= false,
+                apic_global_enable : bool= false,
+                base_addr : u24= 0,
+                reserved2 : u28= 0,
+            };
+
+            pub const ProcessorLocalAPIC = packed struct {
+                type : u8,
+                length : u8,
+                acpi_proc_id : u8,
+                apic_id : u8,
+                flags : u32,
+            };
+
+            pub const IOAPIC = packed struct {
+                type : u8,
+                length : u8,
+                io_apic_id : u8,
+                reserved : u8,
+                io_apic_addr : u32,
+                gsi_base : u32,
+            };
+
+            pub const IOAPICInterruptSourceOverride = packed struct {
+                type : u8,
+                length : u8,
+                bus_source : u8,
+                irq_source : u8,
+                gsi : u32,
+                flags : u16,
+            };
+
+            pub const MADTEntry = extern struct {
+                type : u8,
+                length : u8,
+            };
+
+            pub const MADT = extern struct {
+                header : arch.acpi.SDTHeader,
+                local_address : u32,
+                flags : u32,
+            };
+
+        };
+
+        pub const ioapic = struct {
+            pub const SourceOverride = struct {
+                gsi : u32,
+                active_low : bool,
+                level_triggered : bool,
+            };
+
+            pub const Controller = struct {
+                io_apic_id : u8,
+                gsi_base : u32,
+                version : u32= 0,
+                redir_entr_count : u32= 0,
+                regs : [*]u32,
+                lock : kernel.Spinlock,
+            };
+
+        };
+
+        pub const logical_id = struct {
+        };
+
+
+        pub extern fn apMain()noreturn;
     };
 
 };
@@ -635,6 +762,7 @@ pub const kernel = struct {
                 SHARED = 1,
                 PRIVATE = 2,
                 SHARED_VALIDATE = 3,
+                DROPPABLE = 8,
             };
 
 
@@ -687,7 +815,9 @@ pub const kernel = struct {
                 brk_start : u32= 0,
                 brk : u32= 0,
                 vas : u32= 0,
+                lock : kernel.Spinlock,
                 vmas : ?*kernel.mm.proc_mm.VMA= null,
+                cpus_cores : std.atomic.Value(u32),
                 ref : kernel.RefCount,
             };
 
@@ -706,6 +836,7 @@ pub const kernel = struct {
     pub const irq = struct {
         pub extern fn registerHandler(u32, *const anyopaque, ?*anyopaque)void;
         pub extern fn unregisterHandler(u32)void;
+        pub extern fn registerIPIHandler(u32, *const anyopaque)void;
     };
 
     pub const exceptions = struct {
@@ -769,6 +900,11 @@ pub const kernel = struct {
             prev : ?*kernel.tree.TreeNode= null,
         };
 
+        pub const TreeIterator = struct {
+            root : *kernel.tree.TreeNode,
+            next_node : ?*kernel.tree.TreeNode,
+        };
+
         pub const Iterator = struct {
             curr : *kernel.tree.TreeNode,
             head : ?*kernel.tree.TreeNode,
@@ -805,6 +941,9 @@ pub const kernel = struct {
     pub const RefCount = struct {
         count : std.atomic.Value(usize),
         dropFn : *const fn(*kernel.RefCount) void,
+    };
+
+    pub const kthread = struct {
     };
 
     pub const task = struct {
@@ -873,6 +1012,16 @@ pub const kernel = struct {
             result : i32= 0,
             should_stop : bool= false,
         };
+
+        pub const initial_task = struct {
+        };
+
+        pub const current_task = struct {
+        };
+
+        pub const stack_top = struct {
+        };
+
 
     };
 
@@ -1030,6 +1179,11 @@ pub const kernel = struct {
     };
 
     pub const jiffies = struct {
+        pub const cpu_user_ticks = struct {
+        };
+
+
+
         pub const CpuTicks = struct {
             user : u64,
             system : u64,
@@ -1078,6 +1232,9 @@ pub const kernel = struct {
             rlim_max : u64,
         };
 
+    };
+
+    pub const random = struct {
     };
 
 
@@ -1234,6 +1391,7 @@ pub const kernel = struct {
                 map : std.bit_set.DynamicBitSet,
                 closexec : std.bit_set.DynamicBitSet,
                 fds : std.hash_map.HashMap(usize, *kernel.fs.file.File, std.hash_map.AutoContext(usize), 80),
+                lock : kernel.Spinlock,
                 ref : kernel.RefCount,
             };
 
@@ -1653,6 +1811,12 @@ pub const kernel = struct {
         pub const rlimit = struct {
         };
 
+        pub const random = struct {
+        };
+
+        pub const affinity = struct {
+        };
+
     };
 
 
@@ -2069,6 +2233,9 @@ pub const drivers = struct {
         };
 
         pub const nulldev = struct {
+        };
+
+        pub const random = struct {
         };
 
         pub const tty = struct {

@@ -48,6 +48,7 @@ fn handlerShbang(
     free_arg_env: bool,
     file: *krn.fs.File,
     resources_released: *bool,
+    filename: []const u8,
 ) anyerror!u32 {
     const new_line_idx = std.mem.indexOf(u8, binary, "\n") orelse binary.len;
     const shebang_line = binary[2..new_line_idx];
@@ -90,8 +91,8 @@ fn handlerShbang(
         arg_idx += 1;
     }
 
-    for (argv) |arg| {
-        new_argv[arg_idx] = dupString(arg) orelse {
+    for (argv, 0..) |arg, i| {
+        new_argv[arg_idx] = dupString(if (i == 0) filename else arg) orelse {
             return krn.errors.PosixError.ENOMEM;
         };
         arg_idx += 1;
@@ -121,7 +122,8 @@ fn handlerShbang(
         &new_resources_released,
         new_argv,
         new_envp,
-        true
+        true,
+        new_argv[0],
     );
 }
 
@@ -131,6 +133,7 @@ pub fn doExecve(
     argv: []const []const u8,
     envp: []const []const u8,
     free_arg_env: bool,
+    filename: []const u8,
 ) !u32 {
     // TODO:
     // - check suid / sgid and change euid / egid if needed
@@ -167,15 +170,17 @@ pub fn doExecve(
                 envp,
                 free_arg_env,
                 file,
-                resources_released
+                resources_released,
+                filename,
             );
         },
         .Unknown => return errors.ENOEXEC,
     }
 
-    krn.task.current.setName(file.path.?.dentry.name); // TODO: make copy of filename and set name only if we will execute
+    krn.task.current().setName(file.path.?.dentry.name); // TODO: make copy of filename and set name only if we will execute
+    // TODO: KIll other threads and only proceed when they have already finished
 
-    if (krn.task.current.mm) |_mm| {
+    if (krn.task.current().mm) |_mm| {
         const old_mm = _mm;
         const new_mm = krn.proc_mm.MM.new() orelse
             return krn.errors.PosixError.ENOMEM;
@@ -183,11 +188,11 @@ pub fn doExecve(
             return krn.errors.PosixError.ENOMEM;
         krn.mm.virt_memory_manager.unmapPage(vas_pair.virt, false);
         arch.vmm.switchToVAS(new_mm.vas);
-        krn.task.current.mm = new_mm;
+        krn.task.current().mm = new_mm;
         old_mm.ref.put();
-        if (krn.task.current.vfork_wq) |wq| {
+        if (krn.task.current().vfork_wq) |wq| {
             wq.wakeUpOne();
-            krn.task.current.vfork_wq = null;
+            krn.task.current().vfork_wq = null;
         }
     }
 
@@ -198,21 +203,29 @@ pub fn doExecve(
     );
 
 
-    krn.task.current.sighand = try krn.signals.SigHand.new();
-    var it = krn.task.current.files.closexec.iterator(
+    const old_sighand = krn.task.current().sighand.?;
+    const new_sighand = try krn.signals.SigHand.new();
+    for (0..krn.signals.NSIG) |_sig| {
+        const sig = krn.signals.Signal.fromInt(_sig);
+        const val = old_sighand.actions.getPtr(sig);
+        if (val.handler.handler == krn.signals.sigIGN)
+            new_sighand.actions.getPtr(sig).handler.handler = krn.signals.sigIGN;
+    }
+
+    krn.task.current().sighand = new_sighand;
+    var it = krn.task.current().files.closexec.iterator(
         .{.direction = .forward, .kind = .set}
     );
     while (it.next()) |_fd| {
-        _ = krn.task.current.files.releaseFD(_fd);
+        _ = krn.task.current().files.releaseFD(_fd);
     }
 
-    if (krn.task.current.fpu_state) |state| {
+    arch.fpu.unloadFPUState(krn.task.current());
+    if (krn.task.current().fpu_state) |state| {
         krn.mm.kfree(state);
-        krn.task.current.fpu_state = null;
+        krn.task.current().fpu_state = null;
     }
-    krn.task.current.fpu_used = false;
-    krn.task.current.save_fpu_state = false;
-    arch.fpu.setTaskSwitched();
+    krn.task.current().fpu_used = false;
 
     // Release the file's content buffer since
     // its already copied to the new tasks mappings.
@@ -225,7 +238,9 @@ pub fn doExecve(
     file.ref.put();
     resources_released.* = true;
 
-    arch.syscalls.thread.resetTLS(krn.task.current);
+    arch.syscalls.thread.resetTLS(krn.task.current());
+    krn.task.current().clear_tid = null;
+    krn.task.current().robust_list = null;
 
     krn.userspace.goUserspace();
     return 0;
@@ -301,5 +316,6 @@ pub fn execve(
         argv_slice,
         envp_slice,
         true,
+        user_filename,
     );
 }

@@ -108,10 +108,10 @@ pub fn socketpair(family: i32, s_type: i32, protocol: i32, usockvec: [*]i32) !u3
     krn.logger.INFO("socketpair: {d} {d} {d} {any}", .{family, s_type, protocol, usockvec});
     var file1: *krn.fs.File = undefined;
     var file2: *krn.fs.File = undefined;
-    const fd1: u32 = try krn.task.current.files.getNextFD();
-    const fd2: u32 = try krn.task.current.files.getNextFD();
-    errdefer _ = krn.task.current.files.releaseFD(fd1);
-    errdefer _ = krn.task.current.files.releaseFD(fd2);
+    const fd1: u32 = try krn.task.current().files.getNextFD();
+    const fd2: u32 = try krn.task.current().files.getNextFD();
+    errdefer _ = krn.task.current().files.releaseFD(fd1);
+    errdefer _ = krn.task.current().files.releaseFD(fd2);
     if (krn.socket.Socket.newSocket()) |sock_a| {
         errdefer krn.mm.kfree(sock_a);
         if (krn.socket.Socket.newSocket()) |sock_b| {
@@ -128,10 +128,14 @@ pub fn socketpair(family: i32, s_type: i32, protocol: i32, usockvec: [*]i32) !u3
             inode2.data.sock = sock_b;
             file1 = try krn.fs.File.pseudo(inode1);
             errdefer file1.ref.put();
+            file1.mode = krn.fs.UMode.socket();
+            file1.flags = krn.fs.file.O_RDWR;
             file2 = try krn.fs.File.pseudo(inode2);
             errdefer file2.ref.put();
-            try krn.task.current.files.setFD(fd1, file1);
-            try krn.task.current.files.setFD(fd2, file2);
+            file2.mode = krn.fs.UMode.socket();
+            file2.flags = krn.fs.file.O_RDWR;
+            try krn.task.current().files.setFD(fd1, file1);
+            try krn.task.current().files.setFD(fd2, file2);
             usockvec[0] = @intCast(fd1);
             usockvec[1] = @intCast(fd2);
         } else {
@@ -160,7 +164,7 @@ pub fn recvfrom(
     }
     if (fd < 0)
         return errors.EBADF;
-    if (krn.task.current.files.fds.get(@intCast(fd))) |file| {
+    if (krn.task.current().files.fds.get(@intCast(fd))) |file| {
         file.ref.get();
         defer file.ref.put();
         return try krn.socket.do_recvfrom(file, @ptrCast(ubuff), size);
@@ -182,7 +186,7 @@ pub fn sendto(fd: i32, buff: ?*anyopaque, len: usize, flags: u32, addr: u32, add
     }
     if (fd < 0)
         return errors.EBADF;
-    if (krn.task.current.files.fds.get(@intCast(fd))) |file| {
+    if (krn.task.current().files.fds.get(@intCast(fd))) |file| {
         file.ref.get();
         defer file.ref.put();
         return try krn.socket.do_sendto(file, @ptrCast(buff), len);
@@ -210,7 +214,7 @@ pub fn sendmsg(sockfd: i32, _msg: ?*MsgHdr, flags: i32) !u32 {
         return errors.EFAULT;
     if (sockfd < 0)
         return errors.EBADF;
-    if (krn.task.current.files.fds.get(@intCast(sockfd))) |file| {
+    if (krn.task.current().files.fds.get(@intCast(sockfd))) |file| {
         if (!file.mode.isSock())
             return errors.ENOTSOCK;
         _ = file.inode.data.sock orelse
@@ -236,7 +240,7 @@ pub fn recvmsg(sockfd: i32, _msg: ?*MsgHdr, flags: i32) !u32 {
         return errors.EFAULT;
     if (sockfd < 0)
         return errors.EBADF;
-    if (krn.task.current.files.fds.get(@intCast(sockfd))) |file| {
+    if (krn.task.current().files.fds.get(@intCast(sockfd))) |file| {
         if (!file.mode.isSock())
             return errors.ENOTSOCK;
         _ = file.inode.data.sock orelse
@@ -270,7 +274,7 @@ pub fn getpeername(
         return errors.EINVAL;
     if (addlen.* < 0)
         return errors.EINVAL;
-    if (krn.task.current.files.fds.get(@intCast(sockfd))) |file| {
+    if (krn.task.current().files.fds.get(@intCast(sockfd))) |file| {
         if (!file.mode.isSock())
             return errors.ENOTSOCK;
         const sock = file.inode.data.sock orelse
@@ -299,7 +303,7 @@ pub fn getsockname(
         return errors.EINVAL;
     if (addlen.* < 0)
         return errors.EINVAL;
-    if (krn.task.current.files.fds.get(@intCast(sockfd))) |file| {
+    if (krn.task.current().files.fds.get(@intCast(sockfd))) |file| {
         if (!file.mode.isSock())
             return errors.ENOTSOCK;
         const sock = file.inode.data.sock orelse
@@ -327,7 +331,7 @@ pub fn getsockopt(
         return errors.EFAULT;
     if (sockfd < 0)
         return errors.EBADF;
-    if (krn.task.current.files.fds.get(@intCast(sockfd))) |file| {
+    if (krn.task.current().files.fds.get(@intCast(sockfd))) |file| {
         if (!file.mode.isSock())
             return errors.ENOTSOCK;
         _ = file.inode.data.sock orelse
@@ -352,7 +356,7 @@ pub fn setsockopt(
         return errors.EFAULT;
     if (sockfd < 0)
         return errors.EBADF;
-    if (krn.task.current.files.fds.get(@intCast(sockfd))) |file| {
+    if (krn.task.current().files.fds.get(@intCast(sockfd))) |file| {
         if (!file.mode.isSock())
             return errors.ENOTSOCK;
         _ = file.inode.data.sock orelse
@@ -369,7 +373,7 @@ pub fn shutdown(sockfd: i32, how: i32) !u32 {
     _ = how;
     if (sockfd < 0)
         return errors.EBADF;
-    if (krn.task.current.files.fds.get(@intCast(sockfd))) |file| {
+    if (krn.task.current().files.fds.get(@intCast(sockfd))) |file| {
         if (!file.mode.isSock())
             return errors.ENOTSOCK;
         _ = file.inode.data.sock orelse

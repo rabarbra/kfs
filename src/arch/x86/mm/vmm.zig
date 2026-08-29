@@ -1,3 +1,6 @@
+const smp = @import("../smp/main.zig");
+const idt = @import("../idt.zig");
+const cpu = @import("../system/cpu.zig");
 const printf = @import("debug").printf;
 const PMM = @import("./pmm.zig").PMM;
 const krn = @import("kernel");
@@ -32,15 +35,77 @@ pub extern var initial_page_dir: [1024]u32;
 pub const current_page_dir: [*]PageEntry = @ptrFromInt(0xFFFFF000);
 pub const first_page_table: [*]PageEntry = @ptrFromInt(0xFFC00000);
 
+pub const tlb_ack = smp.PerCpu(std.atomic.Value(u32), std.atomic.Value(u32).init(0), opaque{});
+
+noinline fn flushTLBAllButSelf() void {
+    var cpu_cores = std.bit_set.IntegerBitSet(32).initEmpty();
+    cpu_cores.setRangeValue(
+        .{
+            .start = 0,
+            .end = smp.cpu_count,
+        },
+        true
+    );
+    flushTLB(cpu_cores);
+}
+
+fn flushTLB(cpus_cores: std.bit_set.IntegerBitSet(32)) void {
+    if (!smp.smp_enabled)
+        return ;
+    const _sendIPI = cpu.operations.sendIPI orelse
+        return ;
+    var it = cpus_cores.iterator(.{
+        .direction = .forward,
+        .kind = .set
+    });
+    while (it.next()) |logical_id| {
+        if (logical_id == smp.logical_id.get())
+            continue;
+        const counter = tlb_ack.ptrOn(logical_id);
+        _ = counter.fetchAdd(1, .seq_cst);
+        const phys_id = smp.physical_id.ptrOn(logical_id).*;
+        _sendIPI(phys_id, idt.TLB_INTERRUPT);
+    }
+    while (true) {
+        var ack_it = cpus_cores.iterator(.{
+            .direction = .forward,
+            .kind = .set
+        });
+        var all_acknowledged: bool = true;
+        while (ack_it.next()) |logical_id| {
+            if (logical_id == smp.logical_id.get())
+                continue;
+            const counter = tlb_ack.ptrOn(logical_id);
+            if (counter.load(.seq_cst) != 0) {
+                all_acknowledged = false;
+                break;
+            }
+        }
+        if (all_acknowledged)
+            break;
+    }
+}
+
 pub inline fn switchToVAS(vas: u32) void {
-    asm volatile("mov %[pd], %cr3"::[pd] "r" (vas));
+    asm volatile(
+        "mov %[pd], %cr3"
+        :
+        :[pd] "r" (vas),
+        : .{ .memory = true }
+    );
 }
 
 pub inline fn invalidatePage(page: usize) void {
     asm volatile ("invlpg (%eax)"
         :
         : [pg] "{eax}" (page),
+        : .{ .memory = true }
     );
+}
+
+pub export fn shootdownTLB() void {
+    switchToVAS(getCR3());
+    tlb_ack.ptr().store(0, .seq_cst); // ACK
 }
 
 pub inline fn getCR0() u32 {
@@ -195,10 +260,11 @@ pub const VMM = struct {
         const pt_index = (virt >> 12) & 0x3FF;
         const pt: [*]PageEntry = first_page_table + (0x400 * pd_index);
         const pfn: u32 = @as(u32, pt[pt_index].address) << 12;
-        if (free_pfn)
-            self.pmm.freePage(pfn);
         pt[pt_index].erase();
         invalidatePage(virt);
+        flushTLBAllButSelf();
+        if (free_pfn)
+            self.pmm.freePage(pfn);
     }
 
     pub fn mapPage(
@@ -317,7 +383,12 @@ pub const VMM = struct {
         @memcpy(to_copy[0..PAGE_SIZE], from_copy[0..PAGE_SIZE]);
         const page_flags: u12 = @truncate(old_pt[pt_idx] & 0xFFF);
         new_pt[pt_idx] = new_page | page_flags;
-        self.unmapPage(virt, false);
+
+        // This pt mapping is only accessed by this mem_lock protected copy,
+        // so no other core can have a cache for it - no TLB shutdown needed
+        const tmp_pt: [*]PageEntry = first_page_table + 0x400 * (virt >> 22);
+        tmp_pt[(virt >> 12) & 0x3FF].erase();
+        invalidatePage(virt);
     }
 
     pub fn dupArea(self: *VMM, start: u32, end: u32, pair: VASpair, area_type: krn.mm.MAP_TYPE) !void{
@@ -384,6 +455,10 @@ pub const VMM = struct {
                     },
                     .SHARED, .SHARED_VALIDATE => {
                         new_pt[pt_idx] = old_pt[pt_idx];
+                    },
+                    else => {
+                        // TODO
+                        return krn.errors.PosixError.ENOSYS;
                     }
                 }
             }
@@ -391,12 +466,14 @@ pub const VMM = struct {
         }
     }
 
-    pub fn releaseArea(self: *VMM, start: u32, end: u32, area_type: krn.mm.MAP_TYPE) void {
-        if (area_type == .SHARED) {
-            // FIXME: accounting for shared mappings
-            krn.logger.INFO("We should somehow refcount pages and only free when the last user frees\n", .{});
-            return;
-        }
+    pub fn releaseArea(
+        self: *VMM,
+        start: u32,
+        end: u32,
+        vma: *krn.proc_mm.VMA,
+    ) void {
+        // FIXME: shared frames need refcounting; unmap them but never free
+        const free_phys = vma.flags.TYPE != .SHARED;
         const pd: [*]u32 = @ptrCast(current_page_dir);
 
         // Calculate page-aligned boundaries for exclusive end
@@ -435,20 +512,27 @@ pub const VMM = struct {
             for (pt_start_idx .. pt_end) |pt_idx| {
                 if (pt[pt_idx] != 0) {
                     const phys: u32 = (pt[pt_idx] >> 12) << 12;
-                    self.pmm.freePage(phys);
                     pt[pt_idx] = 0; // Clear the PTE
+                    invalidatePage(
+                        self.pageTableToAddr(pd_idx, pt_idx),
+                    );
+                    flushTLB(vma.mm.?.cpuMask());
+                    if (free_phys)
+                        self.pmm.freePage(phys);
                 }
             }
             if (std.mem.allEqual(u32, pt[0..1024], 0)) {
-                self.pmm.freePage((pd[pd_idx] >> 12) << 12);
+                const pt_phys: u32 = (pd[pd_idx] >> 12) << 12;
                 pd[pd_idx] = 0;
                 invalidatePage(
                     self.pageTableToAddr(pd_idx, 0)
                 );
+                flushTLB(vma.mm.?.cpuMask());
+                self.pmm.freePage(pt_phys);
             }
 
             pt_start_idx = 0;
         }
-        switchToVAS(krn.task.current.mm.?.vas);
+        switchToVAS(krn.task.current().mm.?.vas);
     }
 };

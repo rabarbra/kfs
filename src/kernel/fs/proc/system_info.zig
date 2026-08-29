@@ -16,9 +16,9 @@ fn countTasks() TaskCounters {
     const lock_state = krn.task.tasks_lock.lock_irq_disable();
     defer krn.task.tasks_lock.unlock_irq_enable(lock_state);
 
-    var it = krn.task.initial_task.list.iterator();
+    var it = krn.task.processTreeRoot().tree.treeIterator();
     while (it.next()) |node| {
-        const task = node.curr.entry(krn.task.Task, "list");
+        const task = node.entry(krn.task.Task, "tree");
         if (task.state == .STOPPED or task.state == .ZOMBIE)
             continue;
 
@@ -174,7 +174,7 @@ fn loadavg_open(file: *krn.fs.File, _: *krn.fs.Inode) !void {
     const counters = countTasks();
     const runnable = counters.running;
     const total = counters.total;
-    const last_pid = krn.task.current.pid;
+    const last_pid = krn.task.current().pid;
 
     const buff_size = std.fmt.count("0.00 0.00 0.00 {d}/{d} {d}\n", .{
         runnable,

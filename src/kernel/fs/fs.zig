@@ -1,4 +1,5 @@
 pub const kernel = @import("../main.zig");
+const arch = @import("arch");
 // SuperBlock
 pub const SuperBlock = @import("./super.zig").SuperBlock;
 pub const Statfs = @import("./super.zig").Statfs;
@@ -249,15 +250,15 @@ pub const UMode = packed struct {
     }
 
     pub fn canRead(self: *const UMode, uid: u32, gid: u32) bool {
-        if (kernel.task.current.uid == 0) 
+        if (kernel.task.current().uid == 0) 
             return true;
-        if (kernel.task.current.uid == uid) {
+        if (kernel.task.current().uid == uid) {
             if (self.isUReadable()) {
                 return true;
             }
             return false;
         }
-        if (kernel.task.current.inGroup(gid)) {
+        if (kernel.task.current().inGroup(gid)) {
             if (self.isGReadable()) {
                 return true;
             }
@@ -270,15 +271,15 @@ pub const UMode = packed struct {
     }
 
     pub fn canWrite(self: *const UMode, uid: u32, gid: u32) bool {
-        if (kernel.task.current.uid == 0) 
+        if (kernel.task.current().uid == 0) 
             return true;
-        if (kernel.task.current.uid == uid) {
+        if (kernel.task.current().uid == uid) {
             if (self.isUWriteable()) {
                 return true;
             }
             return false;
         }
-        if (kernel.task.current.inGroup(gid)) {
+        if (kernel.task.current().inGroup(gid)) {
             if (self.isGWriteable()) {
                 return true;
             }
@@ -291,15 +292,15 @@ pub const UMode = packed struct {
     }
 
     pub fn canExecute(self: *const UMode, uid: u32, gid: u32) bool {
-        if (kernel.task.current.uid == 0) 
+        if (kernel.task.current().uid == 0) 
             return true;
-        if (kernel.task.current.uid == uid) {
+        if (kernel.task.current().uid == uid) {
             if (self.isUExecutable()) {
                 return true;
             }
             return false;
         }
-        if (kernel.task.current.inGroup(gid)) {
+        if (kernel.task.current().inGroup(gid)) {
             if (self.isGExecutable()) {
                 return true;
             }
@@ -382,10 +383,10 @@ pub const UMode = packed struct {
             .other = 0o7,
             .type = S_IFDIR,
         };
-        if (kernel.task.current == &kernel.task.initial_task) {
+        if (kernel.task.current() == kernel.task.initial_task.ptr()) {
             ret.applyUmask(0o22);
         } else {
-            ret.applyUmask(kernel.task.current.fs.umask);
+            ret.applyUmask(kernel.task.current().fs.umask);
         }
         return ret;
     }
@@ -397,10 +398,10 @@ pub const UMode = packed struct {
             .other = 0o6,
             .type = S_IFREG,
         };
-        if (kernel.task.current == &kernel.task.initial_task) {
+        if (kernel.task.current() == kernel.task.initial_task.ptr()) {
             ret.applyUmask(0o22);
         } else {
-            ret.applyUmask(kernel.task.current.fs.umask);
+            ret.applyUmask(kernel.task.current().fs.umask);
         }
         return ret;
     }
@@ -498,23 +499,29 @@ pub fn init() void {
             kernel.logger.ERROR("Failed to mount root: {t}\n",.{err});
             @panic("Failed to mount root\n");
         };
-        kernel.task.initial_task.fs = FSInfo.new() catch |err| {
+        const initial_fs = FSInfo.new() catch |err| {
             kernel.logger.ERROR(
                 "Failed to alloc FSInfo for initial task: {t}\n",
                 .{err}
             );
             @panic("Initial task must have a root,pwd\n");
         };
-        kernel.task.initial_task.fs.root = path.Path.init(
+        const initial_root = path.Path.init(
             root_mount,
             root_mount.sb.root
         );
-        kernel.task.initial_task.fs.pwd = path.Path.init(
+        const initial_pwd = path.Path.init(
             root_mount,
             root_mount.sb.root
         );
         if (TaskFiles.new()) |files| {
-            kernel.task.initial_task.files = files;
+            for (0..arch.smp.cpu_count) |logical_id| {
+                const idle_task = kernel.task.initial_task.ptrOn(logical_id);
+                idle_task.files = files;
+                idle_task.fs = initial_fs;
+                idle_task.fs.pwd = initial_root;
+                idle_task.fs.root = initial_pwd;
+            }
         } else {
             kernel.logger.ERROR(
                 "Failed to alloc TaskFiles for initial task\n",

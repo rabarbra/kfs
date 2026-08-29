@@ -13,7 +13,7 @@ pub const SyscallHandler = fn (
 ) errors.PosixError!u32;
 
 fn notImpl(_: u32, _: u32, _: u32, _: u32, _: u32, _: u32) !u32 {
-    const state: *arch.Regs = @ptrFromInt(arch.gdt.tss.esp0 - @sizeOf(arch.Regs));
+    const state: *arch.Regs = @ptrFromInt(arch.gdt.tss.ptr().esp0 - @sizeOf(arch.Regs));
     krn.logger.ERROR("syscall {d} {s} is not implemented", .{
         state.eax,
         @tagName(@as(Syscall, @enumFromInt(state.eax)))
@@ -161,6 +161,8 @@ pub const SyscallTable = brk: {
         .SYS_wait4                      = @ptrCast(&krn.syscalls.wait.wait4),
         .SYS_swapoff                    = &notImpl,
         .SYS_sysinfo                    = @ptrCast(&krn.syscalls.sysinfo.sysinfo),
+        .SYS_getrandom                  = @ptrCast(&krn.syscalls.random.getrandom),
+        .SYS_sched_getaffinity          = @ptrCast(&krn.syscalls.affinity.sched_getaffinity),
         .SYS_ipc                        = &notImpl,
         .SYS_fsync                      = &notImpl,
         .SYS_sigreturn                  = @ptrCast(&krn.syscalls.sigaction.sigreturn),

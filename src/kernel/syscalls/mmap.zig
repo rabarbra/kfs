@@ -8,15 +8,25 @@ const mmap_struct = extern struct {
 	len: u32,
 	prot: u32,
 	flags: u32,
-	fd: u32,
+	fd: i32,
 	offset: u32,
 };
 
 pub fn mmap(
     arg: ?*mmap_struct
 ) !u32 {
-    krn.logger.INFO("length {x}\n", .{arg.?.len});
-    return try mmap2(@ptrFromInt(arg.?.addr), arg.?.len, arg.?.prot, @bitCast(arg.?.flags), -1, 0);
+    const _arg = arg orelse
+        return errors.EINVAL;
+    if (_arg.offset % krn.mm.PAGE_SIZE != 0)
+        return errors.EINVAL;
+    return try mmap2(
+        @ptrFromInt(_arg.addr),
+        _arg.len,
+        _arg.prot,
+        @bitCast(_arg.flags),
+        _arg.fd,
+        _arg.offset / krn.mm.PAGE_SIZE
+    );
 }
 
 pub fn mmap2(
@@ -48,12 +58,19 @@ pub fn mmap2(
             flags.STACK, flags.GROWSDOWN, flags.EXECUTABLE
     });
 
+    if (length == 0)
+        return errors.EINVAL;
+
     if (prot & ~(mm.PROT_EXEC | mm.PROT_READ | mm.PROT_WRITE | mm.PROT_NONE) > 0)
         return errors.EINVAL;
     const offset: u32 = off * krn.mm.PAGE_SIZE;
 
-    if (!flags.ANONYMOUS and fd >= 0) {
-        if (krn.task.current.files.fds.get(@intCast(fd))) |_file| {
+    if (!flags.ANONYMOUS) {
+        if (fd < 0)
+            return errors.EBADF;
+        if (flags.TYPE != .SHARED and flags.TYPE != .SHARED_VALIDATE and flags.TYPE != .PRIVATE)
+            return errors.EINVAL;
+        if (krn.task.current().files.fds.get(@intCast(fd))) |_file| {
             _file.ref.get();
             defer _file.ref.put();
             if (!_file.mode.canRead(_file.inode.uid, _file.inode.gid))
@@ -73,6 +90,8 @@ pub fn mmap2(
         }
     }
 
+    if (flags.TYPE != .SHARED and flags.TYPE != .DROPPABLE and flags.TYPE != .PRIVATE)
+        return errors.EINVAL;
     // addr specifies the wanted virtual address (suggestion)
     // length is the size of the mapping
     const len: u32 = arch.pageAlign(length, false);
@@ -84,14 +103,14 @@ pub fn mmap2(
             }
             hint = arch.pmm.pageAlign(hint, false);
         }
-        if (!flags.FIXED and hint < krn.task.current.mm.?.heap)
-            hint = krn.task.current.mm.?.heap;
+        if (!flags.FIXED and hint < krn.task.current().mm.?.heap)
+            hint = krn.task.current().mm.?.heap;
     } else {
         // look through mappings and just give back one.
-        hint = krn.task.current.mm.?.heap;
+        hint = krn.task.current().mm.?.heap;
     }
     // TODO: not adding READ and WRITE flags but implement mprotect
-    return try krn.task.current.mm.?.mmap_area(
+    return try krn.task.current().mm.?.mmap_area(
         hint,
         len,
         prot | mm.PROT_WRITE | mm.PROT_READ,
@@ -102,6 +121,9 @@ pub fn mmap2(
 }
 
 pub fn do_munmap(task_mm: *krn.mm.MM, start: u32, end: u32) !u32 {
+    task_mm.lock.lock();
+    defer task_mm.lock.unlock();
+
     if (task_mm.vmas) |head| {
         var current_node: ?*krn.list.ListHead = &head.list;
 
@@ -128,7 +150,11 @@ pub fn do_munmap(task_mm: *krn.mm.MM, start: u32, end: u32) !u32 {
                 }
 
                 node.del();
-                krn.mm.virt_memory_manager.releaseArea(vma.start, vma.end, vma.flags.TYPE);
+                krn.mm.virt_memory_manager.releaseArea(
+                    vma.start,
+                    vma.end,
+                    vma,
+                );
                 krn.mm.kfree(vma);
             } else if (vma.start < start and vma.end > end) {
                 // 2. Split mapping into 2 parts.
@@ -136,22 +162,33 @@ pub fn do_munmap(task_mm: *krn.mm.MM, start: u32, end: u32) !u32 {
                 if (new_vma == null) return errors.ENOMEM;
                 new_vma.?.start = end;
                 new_vma.?.end = vma.end;
-                new_vma.?.mm = task_mm;
                 new_vma.?.prot = vma.prot;
                 new_vma.?.flags = vma.flags;
                 new_vma.?.mm = task_mm;
                 vma.end = start;
                 node.add(&new_vma.?.list);
 
-                krn.mm.virt_memory_manager.releaseArea(start, end, vma.flags.TYPE);
+                krn.mm.virt_memory_manager.releaseArea(
+                    start,
+                    end,
+                    vma,
+                );
             } else if (vma.start < start and vma.end > start) {
                 // 3. Partially remove mapping from the end.
-                krn.mm.virt_memory_manager.releaseArea(start, vma.end, vma.flags.TYPE);
+                krn.mm.virt_memory_manager.releaseArea(
+                    start,
+                    vma.end,
+                    vma,
+                );
                 vma.end = start;
 
             } else if (vma.start < end and vma.end > end) {
                 // 4. Partially remove mapping from the beginning.
-                krn.mm.virt_memory_manager.releaseArea(vma.start, end, vma.flags.TYPE);
+                krn.mm.virt_memory_manager.releaseArea(
+                    vma.start,
+                    end,
+                    vma,
+                );
                 vma.start = end;
             }
 
@@ -176,7 +213,7 @@ pub fn munmap(
         return errors.EINVAL;
     if (start + len > krn.mm.PAGE_OFFSET)
         return errors.EINVAL;
-    if (krn.task.current.mm == null)
+    if (krn.task.current().mm == null)
         return errors.EINVAL;
-    return try do_munmap(krn.task.current.mm.?, start, start + len);
+    return try do_munmap(krn.task.current().mm.?, start, start + len);
 }

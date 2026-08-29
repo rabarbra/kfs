@@ -40,8 +40,8 @@ const FutexKey = struct {
 
     fn init(uaddr: *u32, flags: u32) FutexKey {
         var _vas: usize = 0;
-        if (flags & FLAGS_SHARED == 0 and krn.task.current.mm != null)
-            _vas = krn.task.current.mm.?.vas;
+        if (flags & FLAGS_SHARED == 0 and krn.task.current().mm != null)
+            _vas = krn.task.current().mm.?.vas;
         return .{
             .addr = @intFromPtr(uaddr),
             .vas = _vas,
@@ -70,8 +70,8 @@ const FutexWaiter = struct {
 };
 
 fn getQueue(key: FutexKey) ?*FutexQueue {
-    const state = futexes_lock.lock_irq_disable();
-    defer futexes_lock.unlock_irq_enable(state);
+    futexes_lock.lock();
+    defer futexes_lock.unlock();
 
     if (futexes) |*map|
         return map.get(key);
@@ -79,30 +79,21 @@ fn getQueue(key: FutexKey) ?*FutexQueue {
 }
 
 fn getOrCreateQueue(key: FutexKey) !*FutexQueue {
-    {
-        const state = futexes_lock.lock_irq_disable();
-        defer futexes_lock.unlock_irq_enable(state);
+    futexes_lock.lock();
+    defer futexes_lock.unlock();
 
-        if (futexes == null) {
-            futexes = std.AutoHashMap(FutexKey, *FutexQueue).init(
-                krn.mm.kernel_allocator.allocator(),
-            );
-        }
-        if (futexes.?.get(key)) |q|
-            return q;
+    if (futexes == null) {
+        futexes = std.AutoHashMap(FutexKey, *FutexQueue).init(
+            krn.mm.kernel_allocator.allocator(),
+        );
     }
+    if (futexes.?.get(key)) |q|
+        return q;
 
     const queue = krn.mm.kmalloc(FutexQueue) orelse
         return errors.ENOMEM;
     queue.setup(key);
 
-    const state = futexes_lock.lock_irq_disable();
-    defer futexes_lock.unlock_irq_enable(state);
-
-    if (futexes.?.get(key)) |_q| {
-        krn.mm.kfree(queue);
-        return _q;
-    }
     futexes.?.put(key, queue) catch {
         krn.mm.kfree(queue);
         return errors.ENOMEM;
@@ -126,9 +117,9 @@ fn timeoutMs(utime: ?*krn.time.kernel_timespec) !u32 {
 fn cleanupAfterSleep(waiter: *FutexWaiter) bool {
     while (true) {
         const queue = waiter.queue;
-        const lock_state = queue.lock.lock_irq_disable();
+        queue.lock.lock();
         if (queue != waiter.queue) {
-            queue.lock.unlock_irq_enable(lock_state);
+            queue.lock.unlock();
             continue;
         }
         const woken = waiter.woken;
@@ -136,7 +127,7 @@ fn cleanupAfterSleep(waiter: *FutexWaiter) bool {
             waiter.lst.del();
             waiter.lst.setup();
         }
-        queue.lock.unlock_irq_enable(lock_state);
+        queue.lock.unlock();
         return woken;
     }
 }
@@ -165,7 +156,7 @@ fn futexWait(
 
     var waiter = FutexWaiter{
         .lst = lst.ListHead.init(),
-        .task = krn.task.current,
+        .task = krn.task.current(),
         .bitset = bitset,
         .queue = queue,
         .woken = false,
@@ -178,8 +169,8 @@ fn futexWait(
         return errors.EAGAIN;
     }
     queue.waiters.addTail(&waiter.lst);
-    krn.task.current.wakeup_time = deadline;
-    krn.task.current.state = .INTERRUPTIBLE_SLEEP;
+    krn.task.current().wakeup_time = deadline;
+    krn.task.current().state = .INTERRUPTIBLE_SLEEP;
     queue.lock.unlock_irq_enable(lock_state);
 
     krn.sched.reschedule();
@@ -188,7 +179,7 @@ fn futexWait(
 
     if (woke)
         return 0;
-    if (krn.task.current.hasPendingSignal())
+    if (krn.task.current().hasPendingSignal())
         // An untimed FUTEX_WAIT is restartable. A timed wait would need
         // restart_syscall to resume with the remaining timeout (a plain eip
         // rewind would wait the full duration again), so keep it on EINTR.
@@ -227,8 +218,8 @@ fn futexWake(
 
     var woken: u32 = 0;
     {
-        const qstate = queue.lock.lock_irq_disable();
-        defer queue.lock.unlock_irq_enable(qstate);
+        queue.lock.lock();
+        defer queue.lock.unlock();
 
         var it = queue.waiters.iterator();
         _ = it.next();
@@ -246,6 +237,31 @@ fn futexWake(
     }
     return woken;
 }
+
+fn lock_spinlocks(lock1: *krn.Spinlock, lock2: *krn.Spinlock) void {
+    if (@intFromPtr(lock1) == @intFromPtr(lock2)) {
+        lock1.lock();
+    } else if (@intFromPtr(lock1) < @intFromPtr(lock2)) {
+        lock1.lock();
+        lock2.lock();
+    } else {
+        lock2.lock();
+        lock1.lock();
+    }
+}
+
+fn unlock_spinlocks(lock1: *krn.Spinlock, lock2: *krn.Spinlock) void {
+    if (@intFromPtr(lock1) == @intFromPtr(lock2)) {
+        lock1.unlock();
+    } else if (@intFromPtr(lock1) < @intFromPtr(lock2)) {
+        lock2.unlock();
+        lock1.unlock();
+    } else {
+        lock1.unlock();
+        lock2.unlock();
+    }
+}
+
 
 fn futexRequeue(
     uaddr: ?*u32,
@@ -269,10 +285,8 @@ fn futexRequeue(
 
     var woken: u32 = 0;
 
-    const lock_state = src.lock.lock_irq_disable();
-    defer src.lock.unlock_irq_enable(lock_state);
-    if (dst != src) dst.lock.lock();
-    defer if (dst != src) dst.lock.unlock();
+    lock_spinlocks(&src.lock, &dst.lock);
+    defer unlock_spinlocks(&src.lock, &dst.lock);
 
     var it = src.waiters.iterator();
     _ = it.next();
