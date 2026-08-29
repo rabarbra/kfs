@@ -3,6 +3,7 @@ const mm = @import("init.zig");
 const arch = @import("arch");
 const errors = @import("../syscalls/error-codes.zig").PosixError;
 const krn = @import("../main.zig");
+const std = @import("std");
 
 const STACK_SIZE = mm.PAGE_SIZE * 2000;
 const STACK_TOP = mm.PAGE_OFFSET;
@@ -21,6 +22,7 @@ pub const MAP_TYPE = enum(u4) {
     SHARED = 0x01,
     PRIVATE = 0x02,
     SHARED_VALIDATE = 0x03,
+    DROPPABLE = 0x08,
 };
 
 pub const MAP = packed struct(u32) {
@@ -153,7 +155,11 @@ pub const VMA = struct {
                 var read: usize = 0;
                 while (read < _vma.end - _vma.start) {
                     const ret = _file.ops.read(_file, @ptrCast(&buffer[read]), _vma.end - _vma.start - read) catch {
-                        mm.virt_memory_manager.releaseArea(_vma.start, _vma.end, _vma.flags.TYPE);
+                        mm.virt_memory_manager.releaseArea(
+                            _vma.start,
+                            _vma.end,
+                            _vma,
+                        );
                         krn.mm.kfree(_vma);
                         return null;
                     };
@@ -215,7 +221,9 @@ pub const MM = struct {
     brk_start: usize = 0,
     brk: usize = 0,
     vas: usize = 0,
+    lock: krn.Spinlock = krn.Spinlock.init(),
     vmas: ?*VMA = null,
+    cpus_cores: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     ref: krn.RefCount = krn.RefCount.init(),
 
     pub fn init() MM {
@@ -225,6 +233,7 @@ pub const MM = struct {
             .stack_top = STACK_TOP,
             .stack_bottom = STACK_BOTTOM,
             .vmas = null,
+            .cpus_cores = std.atomic.Value(u32).init(0),
         };
         _mm.ref.get();
         _mm.ref.dropFn = MM.release;
@@ -317,8 +326,8 @@ pub const MM = struct {
         flags: MAP,
         file: ?*krn.fs.File,
         offset: usize,
-    ) !usize
-    {
+    ) !usize {
+
         // 1. check if this addr is taken.
         //  - if free or map fixed, create mappings or replace mappings
         //  - if not free and map fixed replace
@@ -333,6 +342,8 @@ pub const MM = struct {
                 @intCast(end)
             ) catch {};
 
+            self.lock.lock();
+            defer self.lock.unlock();
             new_vma = try self.add_vma(
                 if (self.vmas == null) null else self.findInsertPoint(hint),
                 hint,
@@ -346,10 +357,14 @@ pub const MM = struct {
                 self.vmas = new_vma;
             krn.logger.DEBUG(
                 "[PID {d}] mmap done 0x{x:0>8} - 0x{x:0>8}\n",
-                .{krn.task.current.pid, hint, end}
+                .{krn.task.current().pid, hint, end}
             );
             return @intCast(hint);
         }
+
+        self.lock.lock();
+        defer self.lock.unlock();
+
         if (self.vmas) |list| {
             var it = list.list.iterator();
             while (it.next()) |node| {
@@ -372,7 +387,7 @@ pub const MM = struct {
                         self.vmas = new_vma;
                     krn.logger.DEBUG(
                         "[PID {d}] mmap done 0x{x:0>8} - 0x{x:0>8}\n",
-                        .{krn.task.current.pid, hint, end}
+                        .{krn.task.current().pid, hint, end}
                     );
                     return @intCast(hint);
                 }
@@ -402,7 +417,7 @@ pub const MM = struct {
         }
         krn.logger.DEBUG(
             "[PID {d}] mmap done 0x{x:0>8} - 0x{x:0>8}\n",
-            .{krn.task.current.pid, hint, end}
+            .{krn.task.current().pid, hint, end}
         );
         return @intCast(hint);
     }
@@ -441,6 +456,10 @@ pub const MM = struct {
                 mm.kfree(_mmap);
                 return null;
             }
+
+            self.lock.lock();
+            defer self.lock.unlock();
+
             if (self.vmas) |head| {
                 var it = head.list.iterator();
                 while (it.next()) |entry| {
@@ -483,7 +502,7 @@ pub const MM = struct {
             return ;
 
         if (self.vas != 0) {
-            const curr_vas = krn.task.current.mm.?.vas;
+            const curr_vas = krn.task.current().mm.?.vas;
             self.releaseMappings();
             const lock_state = krn.mm.mem_lock.lock_irq_disable();
             arch.vmm.switchToVAS(self.vas);
@@ -516,8 +535,9 @@ pub const MM = struct {
         self.env_start = 0;
         self.env_end = 0;
 
-        const curr_vas = krn.task.current.mm.?.vas;
+        const curr_vas = krn.task.current().mm.?.vas;
         const is_curr_vas = self.isCurrentMM();
+
         if (self.vmas) |head| {
             while (!head.list.isEmpty()) {
                 const vma: *VMA = head.list.next.?.entry(VMA, "list");
@@ -526,7 +546,11 @@ pub const MM = struct {
                     const lock_state = krn.mm.mem_lock.lock_irq_disable();
                     if (!is_curr_vas)
                         arch.vmm.switchToVAS(self.vas);
-                    mm.virt_memory_manager.releaseArea(vma.start, vma.end, vma.flags.TYPE);
+                    mm.virt_memory_manager.releaseArea(
+                        vma.start,
+                        vma.end,
+                        vma,
+                    );
                     if (!is_curr_vas)
                         arch.vmm.switchToVAS(curr_vas);
                     krn.mm.mem_lock.unlock_irq_enable(lock_state);
@@ -537,7 +561,11 @@ pub const MM = struct {
                 const lock_state = krn.mm.mem_lock.lock_irq_disable();
                 if (!is_curr_vas)
                     arch.vmm.switchToVAS(self.vas);
-                mm.virt_memory_manager.releaseArea(head.start, head.end, head.flags.TYPE);
+                mm.virt_memory_manager.releaseArea(
+                    head.start,
+                    head.end,
+                    head,
+                );
                 if (!is_curr_vas)
                     arch.vmm.switchToVAS(curr_vas);
                 krn.mm.mem_lock.unlock_irq_enable(lock_state);
@@ -548,12 +576,12 @@ pub const MM = struct {
     }
 
     pub inline fn isCurrentMM(self: *MM) bool {
-        return krn.task.current.mm.? == self;
+        return krn.task.current().mm.? == self;
     }
 
     pub fn accessTaskVM(self: *MM, addr: usize, len: usize) ![]u8 {
         if (krn.mm.kmallocSlice(u8, len)) |res| {
-            const curr_vas = krn.task.current.mm.?.vas;
+            const curr_vas = krn.task.current().mm.?.vas;
             if (!self.isCurrentMM()) {
                 arch.cpu.disableInterrupts();
                 arch.vmm.switchToVAS(self.vas);
@@ -567,6 +595,18 @@ pub const MM = struct {
             return res;
         }
         return krn.errors.PosixError.ENOMEM;
+    }
+
+    pub fn setCPU(self: *MM, cpuid: u32) void {
+        _ = self.cpus_cores.bitSet(@intCast(cpuid), .seq_cst);
+    }
+
+    pub fn unsetCPU(self: *MM, cpuid: u32) void {
+        _ = self.cpus_cores.bitReset(@intCast(cpuid), .seq_cst);
+    }
+
+    pub fn cpuMask(self: *MM) std.bit_set.IntegerBitSet(32) {
+        return .{ .mask = self.cpus_cores.load(.seq_cst) };
     }
 };
 

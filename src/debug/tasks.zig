@@ -33,14 +33,14 @@ fn printTask(task: *tsk.Task) void {
 }
 
 pub fn ps() void {
-    var it = tsk.initial_task.list.iterator();
+    var it = tsk.initial_task.ptr().tree.treeIterator();
     while (it.next()) |i| {
-        printTask(i.curr.entry(tsk.Task, "list"));
+        printTask(i.entry(tsk.Task, "tree"));
     }
     if (tsk.stopped_tasks) |stopped| {
         printf("===STOPPED===\n", .{});
-        it = stopped.iterator();
-        while (it.next()) |i| {
+        var _it = stopped.iterator();
+        while (_it.next()) |i| {
             printTask(i.curr.entry(tsk.Task, "list"));
         }
     }
@@ -73,5 +73,5 @@ fn psTreeHelper(task: *tsk.Task, level: u32, last_child: bool) void {
 }
 
 pub fn psTree() void {
-    psTreeHelper(&krn.task.initial_task, 0, false);
+    psTreeHelper(krn.task.initial_task.ptr(), 0, false);
 }

@@ -2,6 +2,8 @@ const atomic = @import("std").atomic;
 const tsk = @import("./task.zig");
 const std = @import("std");
 const arch = @import("arch");
+const sched = @import("./scheduler.zig");
+const dbg = @import("debug");
 
 pub const Spinlock = struct {
     locked: atomic.Value(bool) = atomic.Value(bool).init(false),
@@ -13,8 +15,11 @@ pub const Spinlock = struct {
     // Takes the lock.
     // Can be used in atomic context.
     pub fn lock(self: *Spinlock) void {
+        sched.preemtionDisable();
         while (self.locked.swap(true, .acquire)) {
+            sched.preemtionEnable();
             std.atomic.spinLoopHint();
+            sched.preemtionDisable();
         }
     }
 
@@ -22,16 +27,28 @@ pub const Spinlock = struct {
     // Can be used in atomic context.
     pub fn unlock(self: *Spinlock) void {
         self.locked.store(false, .release);
+        sched.preemtionEnable();
     }
 
     // Disables interrupts before taking the lock
     // Can be take in process context.
     pub fn lock_irq_disable(self: *Spinlock) bool {
         const lock_state = arch.cpu.areIntEnabled();
-        if (lock_state)
-            arch.cpu.disableInterrupts();
-        while (self.locked.swap(true, .acquire)) {
-            std.atomic.spinLoopHint();
+         
+        while (true) {
+            if (lock_state)
+                arch.cpu.disableInterrupts();
+            if (!self.locked.swap(true, .acquire))
+                return lock_state;
+            if (lock_state)                
+                arch.cpu.enableInterrupts();
+            
+            // We need to spin with interrupts enabled,
+            // else we are stuck here - one pause command
+            // with interrupts enabled is not enought no
+            // get IPI interrupt without KVM
+            while (self.locked.load(.monotonic))
+                std.atomic.spinLoopHint();
         }
         return lock_state;
     }

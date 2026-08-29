@@ -11,21 +11,41 @@ const gdt = @import("arch").gdt;
 const krn = @import("../main.zig");
 const arch = @import("arch");
 
-fn processTasks() void {
-    if (tsk.stopped_tasks == null)
+const preemtion_enabled = arch.smp.PerCpu(u32, 0, opaque {});
+
+pub fn preemtionEnable() void {
+    preemtion_enabled.ptr().* -|= 1;
+}
+
+pub fn preemtionDisable() void {
+    preemtion_enabled.ptr().* += 1;
+}
+
+pub inline fn isPreemtionEnabled() bool {
+    return preemtion_enabled.get() == 0;
+}
+
+pub fn processTasks() void {
+    const state = tsk.tasks_lock.lock_irq_disable();
+
+    var task_to_free: ?*krn.task.Task = null;
+
+    if (tsk.stopped_tasks == null) {
+        tsk.tasks_lock.unlock_irq_enable(state);
         return;
-    tsk.tasks_lock.lock();
-    defer tsk.tasks_lock.unlock();
+    }
 
     var it = tsk.stopped_tasks.?.iterator();
-    while (it.next()) |i| {
-        var end: bool = false;
+    top_level: while (it.next()) |i| {
         const curr = i.curr;
         const task = curr.entry(tsk.Task, "list");
-        if (task == tsk.current or !task.refcount.isFree() or task.state == .ZOMBIE)
+        if (task == tsk.current() or !task.refcount.isFree() or task.state == .ZOMBIE)
             continue;
+        for (0..arch.smp.cpu_count) |logical_id| {
+            if (krn.task.current_task.ptrOn(logical_id).* == task)
+                continue: top_level;
+        }
         if (curr.isEmpty()) {
-            end = true;
             tsk.stopped_tasks = null;
         } else {
             it = curr.next.?.iterator();
@@ -34,22 +54,31 @@ fn processTasks() void {
         }
         curr.del();
         task.delFromTree(); // Already done in task finish but safe
-        if (task.mm) |_mm| _mm.delete();
-        kthreadStackFree(task.stack_bottom);
+        task_to_free = task;
         tsk.releasePid(task.pid);
-        km.kfree(task);
-        if (end)
-            break;
+        break;
+    }
+    tsk.tasks_lock.unlock_irq_enable(state);
+
+    if (task_to_free) |to_free| {
+        if (to_free.mm) |_mm| {
+            if (_mm.ref.putAndTest())
+                _mm.delete();
+        }
+        kthreadStackFree(to_free.stack_bottom);
+        km.kfree(to_free);
     }
 }
 
 fn findNextTask() *tsk.Task {
-    if (tsk.current.list.isEmpty())
-        return &tsk.initial_task;
+    if (tsk.current().state == .STOPPED)
+        return tsk.initial_task.ptr();
+    if (tsk.current().list.isEmpty())
+        return tsk.initial_task.ptr();
     tsk.tasks_lock.lock();
     defer tsk.tasks_lock.unlock();
 
-    var it = tsk.current.list.iterator();
+    var it = tsk.current().list.iterator();
     _ = it.next();
     while (it.next()) |i| {
         const task = i.curr.entry(tsk.Task, "list");
@@ -65,16 +94,15 @@ fn findNextTask() *tsk.Task {
         if (task.state == .RUNNING)
             return task;
     }
-    return &tsk.initial_task;
+    return tsk.initial_task.ptr();
 }
 
 pub fn schedule() void {
-    if (tsk.initial_task.list.isEmpty())
-        return;
+    if (!isPreemtionEnabled())
+        return ;
     const flags = arch.cpu.saveFlagsAndCli();
     defer arch.cpu.restoreFlags(flags);
-    processTasks();
-    const prev = tsk.current;
+    const prev = tsk.current();
     const next = findNextTask();
     if (prev != next)
         arch.contextSwitch(prev, next);

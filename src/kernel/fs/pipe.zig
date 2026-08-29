@@ -83,13 +83,13 @@ pub fn read(base: *krn.fs.File, buf: [*]u8, size: usize) !usize {
         if (base.flags & krn.fs.file.O_NONBLOCK != 0)
             return krn.errors.PosixError.EAGAIN;
 
-        var wq_node = krn.wq.WaitQueueNode.init(krn.task.current);
+        var wq_node = krn.wq.WaitQueueNode.init(krn.task.current());
         wq_node.setup();
         pipe.read_queue.addToQueue(&wq_node);
         
         pipe.lock.unlock();
         pipe.read_queue.waitIfInQueue(&wq_node, true, 0);
-        if (krn.task.current.hasPendingSignal()) {
+        if (krn.task.current().hasPendingSignal()) {
             pipe.lock.lock();
             return krn.errors.PosixError.ERESTARTSYS;
         }
@@ -108,7 +108,7 @@ pub fn write(base: *krn.fs.File, buf: [*]const u8, size: usize) !usize {
     defer pipe.lock.unlock();
     if (pipe.readers == 0) {
         _ = try krn.kill(
-            @intCast(krn.task.current.pid),
+            @intCast(krn.task.current().pid),
             @intCast(krn.signals.Signal.SIGPIPE.toPosix())
         );
         return krn.errors.PosixError.EPIPE;
@@ -118,19 +118,19 @@ pub fn write(base: *krn.fs.File, buf: [*]const u8, size: usize) !usize {
         if (base.flags & krn.fs.file.O_NONBLOCK != 0)
             return krn.errors.PosixError.EAGAIN;
 
-        var wq_node = krn.wq.WaitQueueNode.init(krn.task.current);
+        var wq_node = krn.wq.WaitQueueNode.init(krn.task.current());
         wq_node.setup();
         pipe.write_queue.addToQueue(&wq_node);
         pipe.lock.unlock();
         pipe.write_queue.waitIfInQueue(&wq_node, true, 0);
-        if (krn.task.current.hasPendingSignal()) {
+        if (krn.task.current().hasPendingSignal()) {
             pipe.lock.lock();
             return krn.errors.PosixError.ERESTARTSYS;
         }
         pipe.lock.lock();
         if (pipe.readers == 0) {
             _ = try krn.kill(
-                @intCast(krn.task.current.pid),
+                @intCast(krn.task.current().pid),
                 @intCast(krn.signals.Signal.SIGPIPE.toPosix())
             );
             return krn.errors.PosixError.EPIPE;
@@ -145,9 +145,52 @@ pub fn write(base: *krn.fs.File, buf: [*]const u8, size: usize) !usize {
     return size;
 }
 
+fn pipe_poll(
+    base: *krn.fs.File,
+    pollfd: *krn.poll.PollFd,
+    poll_table: ?*krn.poll.PollTable,
+) !u32 {
+    const pipe = base.inode.data.pipe orelse return 0;
+    var read_ready: bool = false;
+    var write_ready: bool = false;
+
+    if (pollfd.events & krn.poll.POLLIN != 0) {
+        pipe.lock.lock();
+        const avail = pipe.rb.available();
+        const pollhup: bool = if (pipe.writers == 0) true else false;
+        pipe.lock.unlock();
+        if (avail > 0) {
+            pollfd.revents |= krn.poll.POLLIN;
+            read_ready = true;
+        }
+        if (pollhup) {
+            pollfd.revents |= krn.poll.POLLHUP;
+            read_ready = true;
+        }
+    }
+    if (pollfd.events & krn.poll.POLLOUT != 0) {
+        if (!pipe.rb.isFull()) {
+            pollfd.revents |= krn.poll.POLLOUT;
+            write_ready = true;
+        }
+        if (pipe.readers == 0) {
+            pollfd.revents |= krn.poll.POLLERR;
+            write_ready = true;
+        }
+    }
+    if (poll_table) |pt| {
+        if (!read_ready and pollfd.events & krn.poll.POLLIN != 0)
+            try pt.addNode(&pipe.read_queue);
+        if (!write_ready and pollfd.events & krn.poll.POLLOUT != 0)
+            try pt.addNode(&pipe.write_queue);
+    }
+    return if (write_ready or read_ready) 1 else 0;
+}
+
 pub const PipeFileOps: krn.fs.FileOps = krn.fs.FileOps {
     .open = open,
     .close = close,
     .write = write,
     .read = read,
+    .poll = pipe_poll,
 };

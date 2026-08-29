@@ -22,6 +22,8 @@ const std = @import("std");
 const cpu = @import("arch").cpu;
 const io = @import("arch").io;
 const modules = @import("modules");
+const smp = @import("arch").smp;
+const acpi = @import("arch").acpi;
 
 pub fn panic(
     msg: []const u8,
@@ -34,12 +36,12 @@ pub fn panic(
     krn.logger.ERROR(
         "\nPANIC: [PID {d}]: {s}",
         .{
-            krn.task.current.pid,
+            krn.task.current().pid,
             msg
         }
     );
-    if (krn.task.current.regs.esp != 0) {
-        const curr_regs: *cpu.Regs = @ptrFromInt(krn.task.current.regs.esp);
+    if (krn.task.current().regs.esp != 0) {
+        const curr_regs: *cpu.Regs = @ptrFromInt(krn.task.current().regs.esp);
         curr_regs.dump();
     } else {
         cpu.Regs.state().dump();
@@ -101,14 +103,19 @@ fn move_root() void {
         const sysfs = krn.fs.path.resolve("/sys") catch {
             @panic("Failed moving dev\n");
         };
-        krn.task.initial_task.fs.root = krn.fs.path.Path.init(
+        const root_path = krn.fs.path.Path.init(
             point,
             point.sb.root,
         );
-        krn.task.initial_task.fs.pwd = krn.fs.path.Path.init(
+        const pwd_path = krn.fs.path.Path.init(
             point,
             point.sb.root,
         );
+        for (0..smp.cpu_count) |logical_id| {
+            const _tsk = krn.task.initial_task.ptrOn(logical_id);
+            _tsk.fs.root = root_path;
+            _tsk.fs.pwd = pwd_path;
+        }
         defer sysfs.dentry.ref.put();
         defer devfs.dentry.ref.put();
         devfs.mnt.remove();
@@ -124,16 +131,16 @@ fn user_thread(_: ?*const anyopaque) i32 {
     while (kernel_ready == false)
         krn.sched.reschedule();
 
-    krn.task.current.fs = krn.task.initial_task.fs.dup() catch
+    krn.task.current().fs = krn.task.initial_task.ptr().fs.dup() catch
         @panic("Allocation PID 1: fs.dup() failed");
-    krn.task.current.files = krn.task.initial_task.files.dup() catch
+    krn.task.current().files = krn.task.initial_task.ptr().files.dup() catch
         @panic("Allocation PID 1: files.dup() failed");
-    krn.task.current.sighand = krn.signals.SigHand.new() catch
+    krn.task.current().sighand = krn.signals.SigHand.new() catch
         @panic("Allocation PID 1: SigHand.new() failed");
-    krn.task.current.thread_data = krn.thread.ThreadData.new() orelse
+    krn.task.current().thread_data = krn.thread.ThreadData.new() orelse
         @panic("Allocation PID 1: ThreadData.new() failed");
-    krn.task.current.tsktype = .PROCESS;
-    krn.fs.procfs.newProcess(krn.task.current) catch {
+    krn.task.current().tsktype = .PROCESS;
+    krn.fs.procfs.newProcess(krn.task.current()) catch {
         @panic("Could not create PID 1 procfs entries\n");
     };
     krn.serial.print("[INIT]: user_thread: executing /bin/init\n");
@@ -184,7 +191,7 @@ export fn kernel_main(magic: u32, address: u32) noreturn {
     krn.boot_info = boot_info;
     krn.serial.print("[INIT]: Multiboot done\n");
 
-    gdt.gdtInit();
+    gdt.init();
     krn.serial.print("[INIT]: GDT done\n");
     krn.pit = PIT.init(1000);
     krn.serial.print("[INIT]: PIT done\n");
@@ -192,15 +199,26 @@ export fn kernel_main(magic: u32, address: u32) noreturn {
     krn.serial.print("[INIT]: IDT done\n");
     mm.mmInit(&krn.boot_info);
     krn.serial.print("[INIT]: Memory done\n");
-    krn.task.initMultitasking();
+    acpi.init();
+    krn.serial.print("[INIT]: ACPI done\n");
+    drv.cmos.init();
+    krn.serial.print("[INIT]: CMOS done\n");
+    krn.task.init();
     krn.serial.print("[INIT]: Multitasking done\n");
-    fpu.setTaskSwitched();
+    smp.init();
+    krn.serial.print("[INIT]: SMP done\n");
+
+    irq.mapAll();
+    krn.jiffies.initTimebase();
     cpu.enableInterrupts();
+
+    // Get PID1
+    init_userspace();
+
+    fpu.setTaskSwitched();
     krn.serial.print("[INIT]: Interrupts are enabled\n");
     dbg.initSymbolTable(&krn.boot_info);
     krn.serial.print("[INIT]: Symbol Table done\n");
-    // Get PID1
-    init_userspace();
 
     screen.initScreen(&krn.scr, &krn.boot_info);
     krn.serial.print("[INIT]: Screen done\n");
@@ -208,10 +226,9 @@ export fn kernel_main(magic: u32, address: u32) noreturn {
     krn.serial.print("[INIT]: Keyboard done\n");
     syscalls.initSyscalls();
     krn.serial.print("[INIT]: Syscalls done\n");
-    drv.cmos.init();
-    krn.serial.print("[INIT]: CMOS done\n");
     krn.vdso.init(); // Should be initialized after cmos
     krn.serial.print("[INIT]: vDSO done\n");
+    // cpuid.logAllFeatures(cpuid.info);
 
     // FS
     krn.fs.init();
@@ -230,8 +247,6 @@ export fn kernel_main(magic: u32, address: u32) noreturn {
     kernel_ready = true;
     krn.serial.print("[INIT]: == READY ==\n");
 
-    while (true) {
-        system.halt();
-    }
+    smp.idle();
     @panic("You shouldn't be here");
 }

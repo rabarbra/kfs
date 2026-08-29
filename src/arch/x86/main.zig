@@ -9,6 +9,7 @@ pub const fpu = @import("fpu.zig");
 pub const Regs = @import("system/cpu.zig").Regs;
 pub const cpu = @import("system/cpu.zig");
 pub const cpuid = @import("system/cpuid.zig");
+pub const acpi = @import("system/acpi.zig");
 pub const saveFlagsAndCli = @import("system/cpu.zig").saveFlagsAndCli;
 pub const restoreFlags = @import("system/cpu.zig").restoreFlags;
 pub const setupStack = @import("system/cpu.zig").setupStack;
@@ -23,5 +24,8 @@ pub const isPageAligned = @import("mm/pmm.zig").isPageAligned;
 
 pub const PAGE_SIZE = @import("mm/pmm.zig").PAGE_SIZE;
 pub const IDT_MAX_DESCRIPTORS = @import("idt.zig").IDT_MAX_DESCRIPTORS;
+pub const MAX_SYSTEM_INTERRUPTS = @import("idt.zig").MAX_SYSTEM_INTERRUPTS;
 pub const CPU_EXCEPTION_COUNT = @import("idt.zig").CPU_EXCEPTION_COUNT;
 pub const SYSCALL_INTERRUPT = @import("idt.zig").SYSCALL_INTERRUPT;
+
+pub const smp = @import("smp/main.zig");

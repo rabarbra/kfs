@@ -36,18 +36,18 @@ pub fn prlimit(pid: i32,
     new_lim: ?*Rlimit,
     old_lim: ?*Rlimit
 ) !u32 {
-    var task: *Task = kernel.task.current;
+    var task: *Task = kernel.task.current();
     var found: bool = false;
     if (pid < 0)
-        return errors.EINVAL;
+        return errors.ESRCH;
 
     // If pid is 0, then the call applies to the calling process
     if (pid != 0) {
         const lock_state = kernel.task.tasks_lock.lock_irq_disable();
         defer kernel.task.tasks_lock.unlock_irq_enable(lock_state);
-        var it = kernel.task.initial_task.list.iterator();
+        var it = kernel.task.processTreeRoot().tree.treeIterator();
         while (it.next()) |node| {
-            const curr_task: *Task = node.curr.entry(Task, "list");
+            const curr_task: *Task = node.entry(Task, "tree");
             if (curr_task.pid == pid) {
                 curr_task.refcount.get();
                 task = curr_task;
@@ -63,9 +63,9 @@ pub fn prlimit(pid: i32,
 }
 
 pub fn setrlimit(resource: i32, rlim: ?*Rlimit) !u32 {
-    return doPrlimit(kernel.task.current, resource, rlim, null);
+    return doPrlimit(kernel.task.current(), resource, rlim, null);
 }
 
 pub fn getrlimit(resource: i32, rlim: ?*Rlimit) !u32 {
-    return doPrlimit(kernel.task.current, resource, null, rlim);
+    return doPrlimit(kernel.task.current(), resource, null, rlim);
 }

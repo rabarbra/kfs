@@ -1,10 +1,10 @@
-
 const krn = @import("kernel");
+const io = @import("../io.zig");
 const KERNEL_CODE_SEGMENT = @import("../idt.zig").KERNEL_CODE_SEGMENT;
 const KERNEL_DATA_SEGMENT = @import("../idt.zig").KERNEL_DATA_SEGMENT;
 const USER_CODE_SEGMENT = @import("../idt.zig").USER_CODE_SEGMENT;
 const USER_DATA_SEGMENT = @import("../idt.zig").USER_DATA_SEGMENT;
-
+const GS_OFFSET = @import("../gdt.zig").GS_OFFSET;
 
 pub const Regs = struct {
     gs: u32,
@@ -30,7 +30,7 @@ pub const Regs = struct {
 
     pub fn init() Regs {
         return Regs{
-            .gs = KERNEL_DATA_SEGMENT,
+            .gs = GS_OFFSET,
             .fs = KERNEL_DATA_SEGMENT,
             .es = KERNEL_DATA_SEGMENT,
             .ds = KERNEL_DATA_SEGMENT,
@@ -62,7 +62,7 @@ pub const Regs = struct {
     }
 
     pub fn state() *Regs{
-        const stack_bottom = krn.task.current.stack_bottom;
+        const stack_bottom = krn.task.current().stack_bottom;
         return @ptrFromInt(stack_bottom + krn.STACK_SIZE - @sizeOf(Regs));
     }
 
@@ -244,6 +244,23 @@ pub const TSS = packed struct {
     }
 };
 
+fn legacySendEOI(int_num: u32) void {
+    io.outb(0x20, 0x20);
+    if (int_num >= 40) {
+        io.outb(0xA0, 0x20);
+    }
+}
+
+pub var operations: Operations = Operations{
+    .sendEOI = legacySendEOI,
+    .sendIPI = null,
+};
+
+pub const Operations = struct {
+    sendEOI: *const fn (int_num: u32) void,
+    sendIPI: ?*const fn (apic_id: u32, vector: u8) void = null,
+};
+
 pub fn enableInterrupts() void {
     asm volatile ("sti");
 }
@@ -257,4 +274,36 @@ pub inline fn getStackFrameAddr() usize {
         \\ movl %ebp, %[value]
         : [value] "={eax}" (-> usize),
     );
+}
+
+pub fn rdmsr(register: u32) u64 {
+    var eax: u32 = 0;
+    var edx: u32 = 0;
+    asm volatile(
+        \\ rdmsr
+        :   [eax] "={eax}" (eax),
+            [edx] "={edx}" (edx),
+        :   [register] "{ecx}" (register),
+        :   .{ .memory = true }
+    );
+    return (@as(u64, edx) << 32) | @as(u64, eax);
+}
+
+pub inline fn rdtsc() u64 {
+    var low: u32 = 0;
+    var high: u32 = 0;
+    asm volatile (
+        \\ rdtsc
+        :   [low] "={eax}" (low),
+            [high] "={edx}" (high),
+    );
+    return (@as(u64, high) << 32) | @as(u64, low);
+}
+
+pub inline fn halt() void {
+    asm volatile ("hlt");
+}
+
+pub inline fn cpuRelax() void {
+    asm volatile ("pause");
 }

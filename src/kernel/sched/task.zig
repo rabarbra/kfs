@@ -13,6 +13,7 @@ const signal = @import("./signals.zig");
 const ThreadHandler = @import("./kthread.zig").ThreadHandler;
 const mm = @import("../mm/init.zig");
 const errors = @import("../syscalls/error-codes.zig").PosixError;
+const smp = arch.smp;
 
 var pid_bitset = std.bit_set.ArrayBitSet(
     usize,
@@ -189,8 +190,9 @@ pub const Task = struct {
         return false;
     }
 
+    /// Use only for initial idle tasks (sets pid to 0)
     pub fn setup(self: *Task, task_stack_top: usize, task_stack_bottom: usize, name: []const u8) !void {
-        try self.assignPID();
+        self.pid = 0;
         self.tgid = self.pid;
         self.uid = 0;
         self.regs.setStackPointer(task_stack_top);
@@ -235,14 +237,14 @@ pub const Task = struct {
         const tmp = Task.init(uid, gid, pgid, tp);
         self.uid = tmp.uid;
         self.gid = tmp.gid;
-        self.groups_count = current.groups_count;
+        self.groups_count = current().groups_count;
         @memcpy(
             self.groups[0..MAX_GROUPS],
-            current.groups[0..MAX_GROUPS]
+            current().groups[0..MAX_GROUPS]
         );
         self.pgid = tmp.pgid;
-        self.sid = current.sid;
-        self.ctty = current.ctty;
+        self.sid = current().sid;
+        self.ctty = current().ctty;
         if (self.ctty) |ctty| {
             ctty.ref.get();
         }
@@ -274,7 +276,7 @@ pub const Task = struct {
         self.group_leader = group_leader;
 
         self.setName(name);
-        self.sigmask = current.sigmask;
+        self.sigmask = current().sigmask;
         self.altstack = tmp.altstack;
         self.wait_wq = krn.wq.WaitQueueHead.init();
         self.wait_wq.setup();
@@ -293,9 +295,10 @@ pub const Task = struct {
 
         if (self.group_leader == self) {
             // Process not thread
-            current.group_leader.tree.addChild(&self.tree);
+            current().group_leader.tree.addChild(&self.tree);
         }
-        current.list.addTail(&self.list);
+        const cpu_to_run = self.pid % arch.smp.cpu_count;
+        initial_task.ptrOn(cpu_to_run).list.add(&self.list);
     }
 
     fn zombifyChildren(self: *Task) void {
@@ -424,9 +427,9 @@ pub const Task = struct {
 
         self.removeThread();
 
-        if (krn.task.current.vfork_wq) |wq| {
+        if (krn.task.current().vfork_wq) |wq| {
             wq.wakeUpOne();
-            krn.task.current.vfork_wq = null;
+            krn.task.current().vfork_wq = null;
         }
         if (self.fpu_state) |state| {
             self.fpu_used = false;
@@ -443,16 +446,6 @@ pub const Task = struct {
         self.state = .STOPPED;
         const lock_state = if (!tasks_locked) tasks_lock.lock_irq_disable() else false;
         defer if (!tasks_locked) tasks_lock.unlock_irq_enable(lock_state);
-
-        if (self.mm) |_mm| {
-            const mm_ref = _mm.ref.getValue();
-            defer {
-                if (mm_ref > 1) {
-                    self.mm = null;
-                }
-            }
-            _mm.ref.put();
-        }
 
         self.list.del();
         self.refcount.put();
@@ -570,40 +563,70 @@ pub const Task = struct {
 };
 
 pub fn sleep(millis: usize) void {
-    if (current == &initial_task)
+    if (current() == initial_task.ptr())
         return ;
     current.wakeup_time = currentMs() + millis;
     current.state = .UNINTERRUPTIBLE_SLEEP;
     reschedule();
 }
 
-pub var initial_task = Task.init(0, 0, 1, .KTHREAD);
-pub var current = &initial_task;
+pub inline fn current() *Task {
+    return current_task.get();
+}
+
+pub const initial_task = smp.PerCpu(Task, undefined, opaque {});
+pub const current_task = smp.PerCpu(*Task, undefined, opaque{});
+
+// The user process tree hangs off CPU0's initial task.
+pub inline fn processTreeRoot() *Task {
+    return initial_task.ptrOn(0);
+}
+
 pub var tasks_lock: krn.Spinlock = krn.Spinlock.init();
 pub var stopped_tasks: ?*lst.ListHead = null;
 
-extern const stack_top: u32;
-extern const stack_bottom: u32;
+extern const bsp_stack_top: u32;
+extern const bsp_stack_bottom: u32;
 
-var inital_fpu_state = arch.fpu.FPUState{};
+pub const stack_top = smp.PerCpu(usize, undefined, opaque {});
+pub const stack_bottom = smp.PerCpu(usize, undefined, opaque {});
+const inital_fpu_state = smp.PerCpu(arch.fpu.FPUState, undefined, opaque {});
 
-pub fn initMultitasking() void {
-    pid_it = pid_bitset.iterator(.{
-        .direction = .forward,
-        .kind = .unset,
-    });
-    initial_task.setup(
-        @intFromPtr(&stack_top),
-        @intFromPtr(&stack_bottom),
+pub fn initCpuLocal(
+    _stack_top: usize,
+    _stack_bottom: usize,
+) void {
+    initial_task.set(Task.init(0, 0, 1, .KTHREAD));
+    current_task.set(initial_task.ptr());
+    stack_top.set(_stack_top);
+    stack_bottom.set(_stack_bottom);
+    inital_fpu_state.set(arch.fpu.FPUState{});
+
+    initial_task.ptr().setup(
+        _stack_top,
+        _stack_bottom,
         "swapper"
     ) catch |err| {
         krn.logger.ERROR("initMultitasking(): {t}", .{err});
         @panic("Failed to setup initial task!");
     };
-    initial_task.refcount.get();
-    initial_task.mm.?.vas = @intFromPtr(&vmm.initial_page_dir) - krn.mm.PAGE_OFFSET;
-    initial_task.fpu_state = &inital_fpu_state;
-    initial_task.group_leader = &initial_task;
-    krn.irq.registerHandler(0, &krn.timerHandler, null);
+    initial_task.ptr().refcount.get();
+    initial_task.ptr().mm.?.vas = @intFromPtr(&vmm.initial_page_dir) - krn.mm.PAGE_OFFSET;
+    initial_task.ptr().fpu_state = inital_fpu_state.ptr();
+    initial_task.ptr().group_leader = initial_task.ptr();
     arch.system.enableWriteProtect();
+}
+
+pub fn init() void {
+    pid_it = pid_bitset.iterator(.{
+        .direction = .forward,
+        .kind = .unset,
+    });
+    _ = allocPid() catch {};
+
+    initCpuLocal(
+        @intFromPtr(&bsp_stack_top),
+        @intFromPtr(&bsp_stack_bottom),
+    );
+    krn.irq.registerHandler(0, &krn.timerHandler, null);
 }
